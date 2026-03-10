@@ -142,6 +142,25 @@ final class HotkeyMonitor: HotkeyMonitoring {
     }
 
     func stop() {
+        tearDownNativeMonitors()
+        isRunning = false
+        functionElementMatches = [Self.fallbackFunctionElementMatch]
+        resetState()
+        debugLog("stopped")
+    }
+
+    private func resetState() {
+        cancelPendingEventTapRelease(reason: "state reset")
+        cancelInteractionStatePolling(reason: "state reset")
+        observedSources.removeAll()
+        activeSource = nil
+        hasLoggedFirstPublishedPress = false
+        hasLoggedFirstPublishedRelease = false
+        clearPublishedHoldState()
+        lastPointerDownUptime = 0
+    }
+
+    private func tearDownNativeMonitors() {
         if let hidManager {
             IOHIDManagerUnscheduleFromRunLoop(hidManager, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
             IOHIDManagerClose(hidManager, 0)
@@ -158,24 +177,6 @@ final class HotkeyMonitor: HotkeyMonitoring {
         hidManager = nil
         eventTap = nil
         runLoopSource = nil
-        isRunning = false
-        functionElementMatches = [Self.fallbackFunctionElementMatch]
-        resetState()
-        debugLog("stopped")
-    }
-
-    private func resetState() {
-        cancelPendingEventTapRelease(reason: "state reset")
-        cancelInteractionStatePolling(reason: "state reset")
-        observedSources.removeAll()
-        activeSource = nil
-        hasLoggedFirstPublishedPress = false
-        hasLoggedFirstPublishedRelease = false
-        publishedIsDown = false
-        hidFnIsDown = false
-        eventTapFnIsDown = false
-        hasSeenHIDForCurrentHold = false
-        lastPointerDownUptime = 0
     }
 
     private func startEventTap() -> Bool {
@@ -521,15 +522,19 @@ final class HotkeyMonitor: HotkeyMonitoring {
             return nil
         }
 
-        publishedIsDown = false
-        hidFnIsDown = false
-        eventTapFnIsDown = false
-        hasSeenHIDForCurrentHold = false
+        clearPublishedHoldState()
         updateActiveSource(source)
         logFirstPublishedEventIfNeeded(.released, source: source)
         debugLog("published hotkey event=released source=\(source.rawValue)")
         onEvent?(.released)
         return .released
+    }
+
+    private func clearPublishedHoldState() {
+        publishedIsDown = false
+        hidFnIsDown = false
+        eventTapFnIsDown = false
+        hasSeenHIDForCurrentHold = false
     }
 
     private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {

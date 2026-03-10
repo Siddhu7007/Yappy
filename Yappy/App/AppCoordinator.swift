@@ -156,11 +156,8 @@ final class AppCoordinator {
         stopPermissionPolling()
         cancelPendingHotkeyRelease(reason: "app stop")
         cancelSpeechRecovery(reason: "app stop", resetAttemptState: true)
-        isHotkeyHeld = false
-        lastMeasuredSpeechLevel = 0
-        lastAudibleSpeechUptime = 0
-        currentErrorCause = nil
-        isAwaitingRecoveredHotkeyObservation = false
+        resetHotkeySessionTracking()
+        clearCoordinatorErrorState()
         speechMonitor.stop()
         hotkeyMonitor.stop()
         interactionMonitor.stop()
@@ -179,9 +176,8 @@ final class AppCoordinator {
             cancelSpeechRecovery(reason: "fresh hotkey press", resetAttemptState: true)
             debugLog("received hotkey pressed")
             isHotkeyHeld = true
-            lastMeasuredSpeechLevel = 0
-            lastAudibleSpeechUptime = 0
-            panelController.apply(speechLevel: 0)
+            resetSpeechTracking()
+            resetSpeechLevelDisplay()
             stateMachine.handle(.hotkeyPressed)
             startSpeechMonitoring()
         case .released:
@@ -203,31 +199,35 @@ final class AppCoordinator {
         statusItemController.updateEnabled(enabled)
 
         if enabled {
-            interactionMonitor.start()
-            stopPermissionPolling()
-            let monitoringStarted = startMonitoring(requestAccessIfNeeded: requestAccessIfNeeded)
-            guard monitoringStarted else {
-                return
-            }
-
-            currentErrorCause = nil
-            isAwaitingRecoveredHotkeyObservation = false
-            stateMachine.handle(.setEnabled(true))
-        } else {
-            interactionMonitor.stop()
-            cancelPendingHotkeyRelease(reason: "disabled")
-            cancelSpeechRecovery(reason: "disabled", resetAttemptState: true)
-            stopPermissionPolling()
-            isHotkeyHeld = false
-            lastMeasuredSpeechLevel = 0
-            lastAudibleSpeechUptime = 0
-            currentErrorCause = nil
-            isAwaitingRecoveredHotkeyObservation = false
-            speechMonitor.stop()
-            panelController.apply(speechLevel: 0)
-            hotkeyMonitor.stop()
-            stateMachine.handle(.setEnabled(false))
+            enableCoordinator(requestAccessIfNeeded: requestAccessIfNeeded)
+            return
         }
+
+        disableCoordinator()
+    }
+
+    private func enableCoordinator(requestAccessIfNeeded: Bool) {
+        interactionMonitor.start()
+        stopPermissionPolling()
+        let monitoringStarted = startMonitoring(requestAccessIfNeeded: requestAccessIfNeeded)
+        guard monitoringStarted else {
+            return
+        }
+
+        clearCoordinatorErrorState()
+        stateMachine.handle(.setEnabled(true))
+    }
+
+    private func disableCoordinator() {
+        interactionMonitor.stop()
+        cancelPendingHotkeyRelease(reason: "disabled")
+        cancelSpeechRecovery(reason: "disabled", resetAttemptState: true)
+        stopPermissionPolling()
+        resetHotkeySessionTracking()
+        clearCoordinatorErrorState()
+        stopSpeechMonitoringAndResetVisuals()
+        hotkeyMonitor.stop()
+        stateMachine.handle(.setEnabled(false))
     }
 
     @discardableResult
@@ -267,14 +267,10 @@ final class AppCoordinator {
 
     private func handleInputMonitoringAccessWarning(_ message: String) {
         debugLog("Input Monitoring preflight missing; keeping hotkey monitoring active until a live Fn event or explicit grant")
-        currentErrorCause = .inputMonitoring
-        isAwaitingRecoveredHotkeyObservation = false
+        setCoordinatorErrorState(.inputMonitoring)
         cancelPendingHotkeyRelease(reason: "input monitoring warning")
-        isHotkeyHeld = false
-        lastMeasuredSpeechLevel = 0
-        lastAudibleSpeechUptime = 0
-        speechMonitor.stop()
-        panelController.apply(speechLevel: 0)
+        resetHotkeySessionTracking()
+        stopSpeechMonitoringAndResetVisuals()
         stateMachine.handle(.permissionDenied)
         startPermissionPolling()
         print(message)
@@ -282,14 +278,10 @@ final class AppCoordinator {
 
     private func handleInputMonitoringAccessFailure(_ message: String) {
         debugLog("Input Monitoring missing; failing closed until access is granted")
-        currentErrorCause = .inputMonitoring
-        isAwaitingRecoveredHotkeyObservation = false
+        setCoordinatorErrorState(.inputMonitoring)
         cancelPendingHotkeyRelease(reason: "input monitoring failure")
-        isHotkeyHeld = false
-        lastMeasuredSpeechLevel = 0
-        lastAudibleSpeechUptime = 0
-        speechMonitor.stop()
-        panelController.apply(speechLevel: 0)
+        resetHotkeySessionTracking()
+        stopSpeechMonitoringAndResetVisuals()
         hotkeyMonitor.stop()
         stateMachine.handle(.permissionDenied)
         permissionAccess.openSystemSettings()
@@ -298,14 +290,10 @@ final class AppCoordinator {
     }
 
     private func handleHotkeyMonitoringFailure(_ message: String) {
-        currentErrorCause = .hotkeyMonitoring
-        isAwaitingRecoveredHotkeyObservation = false
+        setCoordinatorErrorState(.hotkeyMonitoring)
         cancelPendingHotkeyRelease(reason: "hotkey monitoring failure")
-        isHotkeyHeld = false
-        lastMeasuredSpeechLevel = 0
-        lastAudibleSpeechUptime = 0
-        speechMonitor.stop()
-        panelController.apply(speechLevel: 0)
+        resetHotkeySessionTracking()
+        stopSpeechMonitoringAndResetVisuals()
         hotkeyMonitor.stop()
         stateMachine.handle(.permissionDenied)
         print(message)
@@ -426,7 +414,7 @@ final class AppCoordinator {
         }
 
         handleSpeechMonitoringFailure(
-            "Yappy needs Microphone access to drive the head motion from your live voice. Enable Microphone in System Settings > Privacy & Security > Microphone.",
+            microphoneAccessMessage,
             openSystemSettings: isHotkeyHeld
         )
     }
@@ -439,12 +427,12 @@ final class AppCoordinator {
         case false:
             debugLog("microphone denied on launch")
             handleSpeechMonitoringFailure(
-                "Yappy needs Microphone access to drive the head motion from your live voice. Enable Microphone in System Settings > Privacy & Security > Microphone.",
+                microphoneAccessMessage,
                 openSystemSettings: false
             )
         case nil:
             debugLog("requested microphone access on launch")
-            print("Yappy requested Microphone access on launch so the head can follow your live voice when Fn is held.")
+            print(microphonePermissionRequestMessage)
         }
     }
 
@@ -457,15 +445,15 @@ final class AppCoordinator {
         case .started:
             return result
         case .permissionPending:
-            print("Yappy requested Microphone access so the head can follow your live voice while Fn is held.")
+            print(microphonePermissionRequestMessage)
         case .denied:
             handleSpeechMonitoringFailure(
-                "Yappy needs Microphone access to drive the head motion from your live voice. Enable Microphone in System Settings > Privacy & Security > Microphone.",
+                microphoneAccessMessage,
                 openSystemSettings: true
             )
         case .unavailable:
             handleSpeechMonitoringFailure(
-                "Yappy could not start microphone monitoring for live head motion.",
+                microphoneUnavailableMessage,
                 openSystemSettings: false
             )
         }
@@ -476,13 +464,9 @@ final class AppCoordinator {
     private func handleSpeechMonitoringFailure(_ message: String, openSystemSettings: Bool) {
         cancelPendingHotkeyRelease(reason: "speech monitoring failure")
         cancelSpeechRecovery(reason: "speech monitoring failure", resetAttemptState: true)
-        currentErrorCause = .speechMonitoring
-        isAwaitingRecoveredHotkeyObservation = false
-        isHotkeyHeld = false
-        lastMeasuredSpeechLevel = 0
-        lastAudibleSpeechUptime = 0
-        speechMonitor.stop()
-        panelController.apply(speechLevel: 0)
+        setCoordinatorErrorState(.speechMonitoring)
+        resetHotkeySessionTracking()
+        stopSpeechMonitoringAndResetVisuals()
         stateMachine.handle(.permissionDenied)
 
         if openSystemSettings {
@@ -506,8 +490,7 @@ final class AppCoordinator {
         }
 
         debugLog("clearing input-monitoring error after \(trigger)")
-        currentErrorCause = nil
-        isAwaitingRecoveredHotkeyObservation = false
+        clearCoordinatorErrorState()
 
         guard isEnabled, !isHotkeyHeld else {
             return
@@ -540,24 +523,25 @@ final class AppCoordinator {
                 return
             }
 
-            self.pendingHotkeyReleaseTask = nil
-            guard self.isEnabled, self.isHotkeyHeld else {
-                return
-            }
-
-            if self.shouldExtendHotkeyReleaseGrace {
-                let elapsedSinceSpeechMilliseconds = self.lastAudibleSpeechUptime > 0
-                    ? Int((ProcessInfo.processInfo.systemUptime - self.lastAudibleSpeechUptime) * 1_000)
-                    : -1
-                self.debugLog(
-                    "extending hotkey release grace while speech or recovery is still active recentSpeechMs=\(elapsedSinceSpeechMilliseconds)"
-                )
-                self.armHotkeyReleaseConfirmation()
-                return
-            }
-
-            self.finalizeHotkeyRelease()
+            self.handlePendingHotkeyReleaseConfirmation()
         }
+    }
+
+    private func handlePendingHotkeyReleaseConfirmation() {
+        pendingHotkeyReleaseTask = nil
+        guard isEnabled, isHotkeyHeld else {
+            return
+        }
+
+        if shouldExtendHotkeyReleaseGrace {
+            debugLog(
+                "extending hotkey release grace while speech or recovery is still active recentSpeechMs=\(recentSpeechMilliseconds)"
+            )
+            armHotkeyReleaseConfirmation()
+            return
+        }
+
+        finalizeHotkeyRelease()
     }
 
     private var shouldExtendHotkeyReleaseGrace: Bool {
@@ -577,16 +561,21 @@ final class AppCoordinator {
         TimeInterval(hotkeyReleaseSpeechContinuationWindowNanoseconds) / 1_000_000_000
     }
 
+    private var recentSpeechMilliseconds: Int {
+        guard lastAudibleSpeechUptime > 0 else {
+            return -1
+        }
+
+        return Int((ProcessInfo.processInfo.systemUptime - lastAudibleSpeechUptime) * 1_000)
+    }
+
     private func finalizeHotkeyRelease() {
         cancelPendingHotkeyRelease(reason: "hotkey release confirmed")
         cancelSpeechRecovery(reason: "hotkey release confirmed", resetAttemptState: true)
         debugLog("confirmed hotkey released")
-        isHotkeyHeld = false
-        lastMeasuredSpeechLevel = 0
-        lastAudibleSpeechUptime = 0
+        resetHotkeySessionTracking()
         stateMachine.handle(.hotkeyReleased)
-        speechMonitor.stop()
-        panelController.apply(speechLevel: 0)
+        stopSpeechMonitoringAndResetVisuals()
     }
 
     private func cancelPendingHotkeyRelease(reason: String) {
@@ -595,6 +584,35 @@ final class AppCoordinator {
             self.pendingHotkeyReleaseTask = nil
             debugLog("cancelled pending hotkey release reason=\(reason)")
         }
+    }
+
+    private func resetHotkeySessionTracking() {
+        isHotkeyHeld = false
+        resetSpeechTracking()
+    }
+
+    private func resetSpeechTracking() {
+        lastMeasuredSpeechLevel = 0
+        lastAudibleSpeechUptime = 0
+    }
+
+    private func resetSpeechLevelDisplay() {
+        panelController.apply(speechLevel: 0)
+    }
+
+    private func stopSpeechMonitoringAndResetVisuals() {
+        speechMonitor.stop()
+        resetSpeechLevelDisplay()
+    }
+
+    private func setCoordinatorErrorState(_ cause: CoordinatorErrorCause) {
+        currentErrorCause = cause
+        isAwaitingRecoveredHotkeyObservation = false
+    }
+
+    private func clearCoordinatorErrorState() {
+        currentErrorCause = nil
+        isAwaitingRecoveredHotkeyObservation = false
     }
 
     private func armInteractionSignalObservation(trigger: InteractionEvent) {
@@ -764,6 +782,18 @@ final class AppCoordinator {
         print(line)
         DebugTrace.log(line)
         #endif
+    }
+
+    private var microphoneAccessMessage: String {
+        "Yappy needs Microphone access to drive the head motion from your live voice. Enable Microphone in System Settings > Privacy & Security > Microphone."
+    }
+
+    private var microphonePermissionRequestMessage: String {
+        "Yappy requested Microphone access so the head can follow your live voice while Fn is held."
+    }
+
+    private var microphoneUnavailableMessage: String {
+        "Yappy could not start microphone monitoring for live head motion."
     }
 
     private func inputMonitoringAccessMessage() -> String {

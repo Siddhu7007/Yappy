@@ -191,6 +191,37 @@ struct HotkeyMonitorTests {
     }
 
     @Test
+    func backgroundPollingCanRecoverAMissedFnPressWithoutInteraction() async {
+        var isFunctionDown = false
+        let monitor = HotkeyMonitor(
+            startHIDMonitorOverride: { false },
+            startEventTapOverride: { true },
+            currentFunctionStateProvider: { isFunctionDown },
+            eventTapReleaseConfirmationDelayNanoseconds: 1_000_000,
+            recentPointerDownEventTapReleaseConfirmationDelayNanoseconds: 40_000_000,
+            recentPointerDownWindowSeconds: 1,
+            backgroundPollingIntervalNanoseconds: 10_000_000,
+            interactionPollingWindowNanoseconds: 0,
+            interactionPollingIntervalNanoseconds: 10_000_000
+        )
+        var events = [HotkeyEvent]()
+        monitor.onEvent = { events.append($0) }
+
+        #expect(monitor.start() == true)
+        try? await Task.sleep(nanoseconds: 30_000_000)
+
+        isFunctionDown = true
+        try? await Task.sleep(nanoseconds: 60_000_000)
+
+        #expect(events == [.pressed])
+
+        isFunctionDown = false
+        try? await Task.sleep(nanoseconds: 60_000_000)
+
+        #expect(events == [.pressed, .released])
+    }
+
+    @Test
     func tapDisableAfterPressWithReleasedStatePublishesSyntheticRelease() {
         let monitor = HotkeyMonitor(
             startHIDMonitorOverride: { false },

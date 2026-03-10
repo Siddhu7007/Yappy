@@ -53,6 +53,7 @@ final class HotkeyMonitor: HotkeyMonitoring {
     private let eventTapReleaseConfirmationDelayNanoseconds: UInt64
     private let recentPointerDownEventTapReleaseConfirmationDelayNanoseconds: UInt64
     private let recentPointerDownWindowSeconds: TimeInterval
+    private let backgroundPollingIntervalNanoseconds: UInt64
     private let interactionPollingWindowNanoseconds: UInt64
     private let interactionPollingIntervalNanoseconds: UInt64
     private var hidManager: IOHIDManager?
@@ -60,6 +61,7 @@ final class HotkeyMonitor: HotkeyMonitoring {
     private var runLoopSource: CFRunLoopSource?
     private var functionElementMatches = Set<FunctionKeyElementMatch>()
     private var pendingEventTapReleaseTask: Task<Void, Never>?
+    private var backgroundStatePollingTask: Task<Void, Never>?
     private var interactionStatePollingTask: Task<Void, Never>?
     private var observedSources = Set<HotkeyInputSource>()
     private var activeSource: HotkeyInputSource?
@@ -80,6 +82,7 @@ final class HotkeyMonitor: HotkeyMonitoring {
         eventTapReleaseConfirmationDelayNanoseconds: UInt64 = 50_000_000,
         recentPointerDownEventTapReleaseConfirmationDelayNanoseconds: UInt64 = 120_000_000,
         recentPointerDownWindowSeconds: TimeInterval = 0.20,
+        backgroundPollingIntervalNanoseconds: UInt64 = 100_000_000,
         interactionPollingWindowNanoseconds: UInt64 = 5_000_000_000,
         interactionPollingIntervalNanoseconds: UInt64 = 50_000_000
     ) {
@@ -90,6 +93,7 @@ final class HotkeyMonitor: HotkeyMonitoring {
         self.recentPointerDownEventTapReleaseConfirmationDelayNanoseconds =
             recentPointerDownEventTapReleaseConfirmationDelayNanoseconds
         self.recentPointerDownWindowSeconds = recentPointerDownWindowSeconds
+        self.backgroundPollingIntervalNanoseconds = backgroundPollingIntervalNanoseconds
         self.interactionPollingWindowNanoseconds = interactionPollingWindowNanoseconds
         self.interactionPollingIntervalNanoseconds = interactionPollingIntervalNanoseconds
     }
@@ -110,6 +114,7 @@ final class HotkeyMonitor: HotkeyMonitoring {
                 120_000_000
             ),
             recentPointerDownWindowSeconds: 0.20,
+            backgroundPollingIntervalNanoseconds: 100_000_000,
             interactionPollingWindowNanoseconds: 5_000_000_000,
             interactionPollingIntervalNanoseconds: 50_000_000
         )
@@ -136,6 +141,7 @@ final class HotkeyMonitor: HotkeyMonitoring {
             "startup result hidStarted=\(hidStarted) eventTapStarted=\(eventTapStarted) matches=\(formattedMatches())"
         )
         if isRunning {
+            armBackgroundStatePolling()
             debugLog("monitor started; waiting for first live Fn event")
         }
         return hidStarted || eventTapStarted
@@ -151,6 +157,7 @@ final class HotkeyMonitor: HotkeyMonitoring {
 
     private func resetState() {
         cancelPendingEventTapRelease(reason: "state reset")
+        cancelBackgroundStatePolling(reason: "state reset")
         cancelInteractionStatePolling(reason: "state reset")
         observedSources.removeAll()
         activeSource = nil
@@ -392,6 +399,43 @@ final class HotkeyMonitor: HotkeyMonitoring {
             pendingEventTapReleaseTask.cancel()
             self.pendingEventTapReleaseTask = nil
             debugLog("cancelled pending eventTap release reason=\(reason)")
+        }
+    }
+
+    private func armBackgroundStatePolling() {
+        guard isRunning else {
+            return
+        }
+
+        guard backgroundPollingIntervalNanoseconds > 0 else {
+            return
+        }
+
+        guard backgroundStatePollingTask == nil else {
+            return
+        }
+
+        debugLog("starting background state polling intervalMs=\(backgroundPollingIntervalNanoseconds / 1_000_000)")
+        backgroundStatePollingTask = Task { @MainActor [weak self] in
+            while let self, self.isRunning {
+                self.handlePolledFunctionState(self.currentFunctionStateProvider())
+
+                do {
+                    try await Task.sleep(nanoseconds: self.backgroundPollingIntervalNanoseconds)
+                } catch {
+                    return
+                }
+            }
+
+            self?.backgroundStatePollingTask = nil
+        }
+    }
+
+    private func cancelBackgroundStatePolling(reason: String) {
+        if let backgroundStatePollingTask {
+            backgroundStatePollingTask.cancel()
+            self.backgroundStatePollingTask = nil
+            debugLog("cancelled background state polling reason=\(reason)")
         }
     }
 

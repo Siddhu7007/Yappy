@@ -18,6 +18,8 @@ The fix path now does three things:
 
 This keeps Yappy from losing the speaking/listening session just because focus changed into a text box.
 
+For a more candid working note on how this was debugged and why it still needs refinement, see [FN_RECOVERY_NOTES.md](FN_RECOVERY_NOTES.md).
+
 ## Permissions
 
 Yappy needs:

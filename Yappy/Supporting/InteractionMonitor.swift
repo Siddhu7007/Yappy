@@ -3,7 +3,7 @@ import AppKit
 enum InteractionEvent: String, Equatable {
     case pointerDown
     case activeApplicationChanged
-    case engineConfigurationChanged
+    case captureRuntimeIssue
 }
 
 @MainActor

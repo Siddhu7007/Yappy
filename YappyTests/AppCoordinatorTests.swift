@@ -148,25 +148,19 @@ struct AppCoordinatorTests {
     }
 
     @Test
-    func hotkeyReleaseGraceDelaysStoppingSpeechMonitoring() async {
+    func hotkeyReleaseStopsSpeechMonitoringImmediatelyWhileListening() {
         let panelController = OverlayPanelControllerSpy()
         let speechMonitor = SpeechMonitorSpy()
         let hotkeyMonitor = HotkeyMonitorSpy()
         let coordinator = makeCoordinator(
             speechMonitor: speechMonitor,
             panelController: panelController,
-            hotkeyMonitor: hotkeyMonitor,
-            hotkeyReleaseGracePeriodNanoseconds: 40_000_000
+            hotkeyMonitor: hotkeyMonitor
         )
 
         coordinator.start()
         hotkeyMonitor.emit(.pressed)
         hotkeyMonitor.emit(.released)
-
-        #expect(speechMonitor.stopCallCount == 0)
-        #expect(panelController.appliedStates.last != .idle)
-
-        try? await Task.sleep(nanoseconds: 80_000_000)
 
         #expect(speechMonitor.stopCallCount == 1)
         #expect(panelController.appliedStates.last == .idle)
@@ -174,65 +168,57 @@ struct AppCoordinatorTests {
     }
 
     @Test
-    func activeSpeechExtendsHotkeyReleaseGraceUntilSpeechStops() async {
+    func postReleaseLevelsDoNotMoveTheOverlayOrRestartListening() {
         let panelController = OverlayPanelControllerSpy()
         let speechMonitor = SpeechMonitorSpy()
         let hotkeyMonitor = HotkeyMonitorSpy()
         let coordinator = makeCoordinator(
             speechMonitor: speechMonitor,
             panelController: panelController,
-            hotkeyMonitor: hotkeyMonitor,
-            hotkeyReleaseGracePeriodNanoseconds: 40_000_000
-        )
-
-        coordinator.start()
-        hotkeyMonitor.emit(.pressed)
-        speechMonitor.emitSpeechActivity(true)
-        hotkeyMonitor.emit(.released)
-
-        try? await Task.sleep(nanoseconds: 80_000_000)
-
-        #expect(speechMonitor.stopCallCount == 0)
-        #expect(panelController.appliedStates.last == .speaking)
-
-        speechMonitor.emitSpeechActivity(false)
-        try? await Task.sleep(nanoseconds: 80_000_000)
-
-        #expect(speechMonitor.stopCallCount == 1)
-        #expect(panelController.appliedStates.last == .idle)
-        #expect(panelController.speechLevels.last == 0)
-    }
-
-    @Test
-    func recentAudibleSpeechExtendsHotkeyReleaseGraceAcrossABriefPause() async {
-        let panelController = OverlayPanelControllerSpy()
-        let speechMonitor = SpeechMonitorSpy()
-        let hotkeyMonitor = HotkeyMonitorSpy()
-        let coordinator = makeCoordinator(
-            speechMonitor: speechMonitor,
-            panelController: panelController,
-            hotkeyMonitor: hotkeyMonitor,
-            hotkeyReleaseGracePeriodNanoseconds: 40_000_000,
-            hotkeyReleaseSpeechContinuationWindowNanoseconds: 200_000_000
+            hotkeyMonitor: hotkeyMonitor
         )
 
         coordinator.start()
         hotkeyMonitor.emit(.pressed)
         speechMonitor.emitSpeechActivity(true)
         speechMonitor.emitLevel(0.62)
-        speechMonitor.emitSpeechActivity(false)
         hotkeyMonitor.emit(.released)
 
-        try? await Task.sleep(nanoseconds: 80_000_000)
-
-        #expect(speechMonitor.stopCallCount == 0)
-        #expect(panelController.appliedStates.last == .listening)
-
-        try? await Task.sleep(nanoseconds: 220_000_000)
+        let stateCountAfterRelease = panelController.appliedStates.count
+        let levelCountAfterRelease = panelController.speechLevels.count
+        speechMonitor.emitSpeechActivity(true)
+        speechMonitor.emitLevel(0.91)
+        speechMonitor.emitSpeechActivity(false)
 
         #expect(speechMonitor.stopCallCount == 1)
+        #expect(panelController.appliedStates.count == stateCountAfterRelease)
+        #expect(panelController.speechLevels.count == levelCountAfterRelease)
         #expect(panelController.appliedStates.last == .idle)
         #expect(panelController.speechLevels.last == 0)
+    }
+
+    @Test
+    func captureRuntimeIssueAfterFnReleaseDoesNotRestartSpeechMonitoring() async {
+        let speechMonitor = SpeechMonitorSpy()
+        let hotkeyMonitor = HotkeyMonitorSpy()
+        let coordinator = makeCoordinator(
+            speechMonitor: speechMonitor,
+            hotkeyMonitor: hotkeyMonitor,
+            interactionRecoveryDelayNanoseconds: 20_000_000,
+            speechRecoverySignalVerificationDelayNanoseconds: 250_000_000
+        )
+
+        coordinator.start()
+        hotkeyMonitor.emit(.pressed)
+        hotkeyMonitor.emit(.released)
+        let startCallCountAfterRelease = speechMonitor.startCallCount
+        let stopCallCountAfterRelease = speechMonitor.stopCallCount
+
+        speechMonitor.emitCaptureRuntimeIssue()
+        try? await Task.sleep(nanoseconds: 120_000_000)
+
+        #expect(speechMonitor.startCallCount == startCallCountAfterRelease)
+        #expect(speechMonitor.stopCallCount == stopCallCountAfterRelease)
     }
 
     @Test
@@ -306,6 +292,55 @@ struct AppCoordinatorTests {
         #expect(speechMonitor.stopCallCount == 1)
         #expect(panelController.appliedStates.last == .idle)
         #expect(panelController.speechLevels.last == 0)
+    }
+
+    @Test
+    func unresolvedSpeechSourceKeepsTheOverlayListeningAndShowsAStatusWarning() {
+        let panelController = OverlayPanelControllerSpy()
+        let speechMonitor = SpeechMonitorSpy(
+            startResults: [.unresolvedSource("Speech Sync: Can't match the selected dictation microphone")]
+        )
+        let hotkeyMonitor = HotkeyMonitorSpy()
+        let statusItemController = StatusItemControllerSpy()
+        let coordinator = makeCoordinator(
+            speechMonitor: speechMonitor,
+            panelController: panelController,
+            hotkeyMonitor: hotkeyMonitor,
+            statusItemController: statusItemController
+        )
+
+        coordinator.start()
+        hotkeyMonitor.emit(.pressed)
+
+        #expect(speechMonitor.startCallCount == 1)
+        #expect(panelController.appliedStates.last == .listening)
+        #expect(statusItemController.warningMessages.last == "Speech Sync: Can't match the selected dictation microphone")
+        #expect(speechMonitor.openSystemSettingsCallCount == 0)
+    }
+
+    @Test
+    func successfulSpeechStartClearsAnExistingSpeechSyncWarning() {
+        let speechMonitor = SpeechMonitorSpy(
+            startResults: [.unresolvedSource("Speech Sync: Can't match the selected dictation microphone"), .started]
+        )
+        let hotkeyMonitor = HotkeyMonitorSpy()
+        let statusItemController = StatusItemControllerSpy()
+        let coordinator = makeCoordinator(
+            speechMonitor: speechMonitor,
+            hotkeyMonitor: hotkeyMonitor,
+            statusItemController: statusItemController
+        )
+
+        coordinator.start()
+        hotkeyMonitor.emit(.pressed)
+        #expect(statusItemController.warningMessages.last == "Speech Sync: Can't match the selected dictation microphone")
+
+        hotkeyMonitor.emit(.released)
+        hotkeyMonitor.emit(.pressed)
+
+        #expect(speechMonitor.startCallCount == 2)
+        #expect(statusItemController.warningMessages.count == 3)
+        #expect(statusItemController.warningMessages[2] == nil)
     }
 
     @Test
@@ -539,7 +574,7 @@ struct AppCoordinatorTests {
     }
 
     @Test
-    func engineConfigurationChangeWhileFnHeldUsesTheSameSpeechRecoveryFlow() async {
+    func captureRuntimeIssueWhileFnHeldUsesTheSameSpeechRecoveryFlow() async {
         let speechMonitor = SpeechMonitorSpy()
         let hotkeyMonitor = HotkeyMonitorSpy()
         let coordinator = makeCoordinator(
@@ -551,7 +586,7 @@ struct AppCoordinatorTests {
 
         coordinator.start()
         hotkeyMonitor.emit(.pressed)
-        speechMonitor.emitEngineConfigurationChanged()
+        speechMonitor.emitCaptureRuntimeIssue()
 
         #expect(speechMonitor.stopCallCount == 1)
         try? await Task.sleep(nanoseconds: 120_000_000)
@@ -568,9 +603,7 @@ struct AppCoordinatorTests {
         interactionRecoveryDelayNanoseconds: UInt64 = 150_000_000,
         speechRecoverySignalVerificationDelayNanoseconds: UInt64 = 1_250_000_000,
         speechRecoverySignalThreshold: Float = 0.005,
-        maxSpeechRecoveryAttempts: Int = 3,
-        hotkeyReleaseGracePeriodNanoseconds: UInt64 = 0,
-        hotkeyReleaseSpeechContinuationWindowNanoseconds: UInt64 = 0
+        maxSpeechRecoveryAttempts: Int = 3
     ) -> AppCoordinator {
         AppCoordinator(
             permissionAccess: inputMonitoringAccess ?? InputMonitoringAccessSpy(),
@@ -582,9 +615,7 @@ struct AppCoordinatorTests {
             interactionRecoveryDelayNanoseconds: interactionRecoveryDelayNanoseconds,
             speechRecoverySignalVerificationDelayNanoseconds: speechRecoverySignalVerificationDelayNanoseconds,
             speechRecoverySignalThreshold: speechRecoverySignalThreshold,
-            maxSpeechRecoveryAttempts: maxSpeechRecoveryAttempts,
-            hotkeyReleaseGracePeriodNanoseconds: hotkeyReleaseGracePeriodNanoseconds,
-            hotkeyReleaseSpeechContinuationWindowNanoseconds: hotkeyReleaseSpeechContinuationWindowNanoseconds
+            maxSpeechRecoveryAttempts: maxSpeechRecoveryAttempts
         )
     }
 }
@@ -594,7 +625,7 @@ private final class SpeechMonitorSpy: SpeechActivityMonitoring {
     var onSpeechActivityChanged: ((Bool) -> Void)?
     var onLevelChanged: ((Float) -> Void)?
     var onPermissionResolved: ((Bool) -> Void)?
-    var onEngineConfigurationChanged: (() -> Void)?
+    var onCaptureRuntimeIssue: (() -> Void)?
 
     private(set) var requestMicrophoneAccessCallCount = 0
     private(set) var startCallCount = 0
@@ -652,8 +683,8 @@ private final class SpeechMonitorSpy: SpeechActivityMonitoring {
         onLevelChanged?(normalizedLevel)
     }
 
-    func emitEngineConfigurationChanged() {
-        onEngineConfigurationChanged?()
+    func emitCaptureRuntimeIssue() {
+        onCaptureRuntimeIssue?()
     }
 }
 
@@ -774,8 +805,13 @@ private final class StatusItemControllerSpy: StatusItemControlling {
     var onQuit: (() -> Void)?
 
     private(set) var enabledValues = [Bool]()
+    private(set) var warningMessages = [String?]()
 
     func updateEnabled(_ enabled: Bool) {
         enabledValues.append(enabled)
+    }
+
+    func updateSpeechSourceWarning(_ message: String?) {
+        warningMessages.append(message)
     }
 }

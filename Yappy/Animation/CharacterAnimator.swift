@@ -24,7 +24,7 @@ final class CharacterAnimator {
             rig.setUpperHeadOpen(false, animated: true)
         case .listening:
             rig.setGlow(active: true, animated: true)
-            applySpeechLevel(currentSpeechLevel)
+            rig.setUpperHeadListening(true, animated: true)
         case .speaking:
             rig.setGlow(active: true, animated: true)
             applySpeechLevel(currentSpeechLevel)
@@ -41,9 +41,9 @@ final class CharacterAnimator {
         currentSpeechLevel = max(0, min(1, normalizedLevel))
 
         switch currentState {
-        case .listening, .speaking:
+        case .speaking:
             applySpeechLevel(currentSpeechLevel)
-        case .idle, .disabled, .error:
+        case .idle, .listening, .disabled, .error:
             return
         }
     }

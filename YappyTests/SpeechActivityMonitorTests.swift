@@ -7,7 +7,11 @@ struct SpeechActivityMonitorTests {
     @Test
     func launchBootstrapReturnsTrueWhenMicrophoneIsAlreadyAuthorized() {
         let permissionController = TestMicrophonePermissionController(status: .authorized)
-        let monitor = SpeechActivityMonitor(permissionController: permissionController)
+        let monitor = SpeechActivityMonitor(
+            audioSourceResolver: TestSpeechAudioSourceResolver(),
+            audioCapture: TestSpeechAudioCaptureController(),
+            permissionController: permissionController
+        )
 
         #expect(monitor.requestMicrophoneAccessIfNeeded() == true)
         #expect(permissionController.requestAccessCallCount == 0)
@@ -16,7 +20,11 @@ struct SpeechActivityMonitorTests {
     @Test
     func launchBootstrapReturnsFalseWhenMicrophoneIsAlreadyDenied() {
         let permissionController = TestMicrophonePermissionController(status: .denied)
-        let monitor = SpeechActivityMonitor(permissionController: permissionController)
+        let monitor = SpeechActivityMonitor(
+            audioSourceResolver: TestSpeechAudioSourceResolver(),
+            audioCapture: TestSpeechAudioCaptureController(),
+            permissionController: permissionController
+        )
 
         #expect(monitor.requestMicrophoneAccessIfNeeded() == false)
         #expect(permissionController.requestAccessCallCount == 0)
@@ -25,7 +33,11 @@ struct SpeechActivityMonitorTests {
     @Test
     func launchBootstrapRequestsPermissionWhenStatusIsUndetermined() async {
         let permissionController = TestMicrophonePermissionController(status: .notDetermined)
-        let monitor = SpeechActivityMonitor(permissionController: permissionController)
+        let monitor = SpeechActivityMonitor(
+            audioSourceResolver: TestSpeechAudioSourceResolver(),
+            audioCapture: TestSpeechAudioCaptureController(),
+            permissionController: permissionController
+        )
         var resolvedValues = [Bool]()
         monitor.onPermissionResolved = { resolvedValues.append($0) }
 
@@ -38,66 +50,59 @@ struct SpeechActivityMonitorTests {
     }
 
     @Test
-    func startReturnsUnavailableWhenInputNodeHasZeroChannelCount() {
+    func startReturnsUnresolvedSourceWhenWisprSourceCannotBeResolved() {
         let permissionController = TestMicrophonePermissionController(status: .authorized)
-        let inputNode = TestSpeechAudioInputNode(
-            liveFormat: SpeechAudioInputFormat(
-                sampleRate: 44_100,
-                channelCount: 0,
-                commonFormat: .pcmFormatFloat32,
-                isInterleaved: false,
-                audioFormat: nil
-            )
+        let resolver = TestSpeechAudioSourceResolver(result: .unresolved(message: "Speech Sync: Can't match the selected dictation microphone"))
+        let capture = TestSpeechAudioCaptureController()
+        let monitor = SpeechActivityMonitor(
+            audioSourceResolver: resolver,
+            audioCapture: capture,
+            permissionController: permissionController
         )
-        let engine = TestSpeechAudioEngine(inputNode: inputNode)
-        let monitor = SpeechActivityMonitor(audioEngine: engine, permissionController: permissionController)
 
-        #expect(monitor.start() == .unavailable)
-        #expect(inputNode.installTapCallCount == 0)
-        #expect(engine.startCallCount == 0)
+        #expect(monitor.start() == .unresolvedSource("Speech Sync: Can't match the selected dictation microphone"))
+        #expect(capture.startCapturingCallCount == 0)
     }
 
     @Test
-    func startReturnsUnavailableWhenInputNodeHasZeroSampleRate() {
+    func startReturnsUnavailableWhenCaptureCannotStart() {
         let permissionController = TestMicrophonePermissionController(status: .authorized)
-        let inputNode = TestSpeechAudioInputNode(
-            liveFormat: SpeechAudioInputFormat(
-                sampleRate: 0,
-                channelCount: 1,
-                commonFormat: .pcmFormatFloat32,
-                isInterleaved: false,
-                audioFormat: nil
-            )
+        let capture = TestSpeechAudioCaptureController(startResult: false)
+        let monitor = SpeechActivityMonitor(
+            audioSourceResolver: TestSpeechAudioSourceResolver(result: .resolved(device: makeCaptureDevice())),
+            audioCapture: capture,
+            permissionController: permissionController
         )
-        let engine = TestSpeechAudioEngine(inputNode: inputNode)
-        let monitor = SpeechActivityMonitor(audioEngine: engine, permissionController: permissionController)
 
         #expect(monitor.start() == .unavailable)
-        #expect(inputNode.installTapCallCount == 0)
-        #expect(engine.startCallCount == 0)
+        #expect(capture.startCapturingCallCount == 1)
+        #expect(capture.lastStartedDevice == makeCaptureDevice())
     }
 
     @Test
-    func int16TapBufferProducesNonzeroLevelAndOpensSpeechGate() async throws {
+    func captureSamplesProduceNonzeroLevelAndOpenSpeechGate() async {
         let permissionController = TestMicrophonePermissionController(status: .authorized)
-        let audioFormat = try #require(makeAudioFormat(commonFormat: .pcmFormatInt16))
-        let inputNode = TestSpeechAudioInputNode(
-            liveFormat: SpeechAudioInputFormat(audioFormat)
+        let capture = TestSpeechAudioCaptureController()
+        let monitor = SpeechActivityMonitor(
+            audioSourceResolver: TestSpeechAudioSourceResolver(result: .resolved(device: makeCaptureDevice())),
+            audioCapture: capture,
+            permissionController: permissionController
         )
-        let engine = TestSpeechAudioEngine(inputNode: inputNode)
-        let monitor = SpeechActivityMonitor(audioEngine: engine, permissionController: permissionController)
         var levels = [Float]()
         var activityChanges = [Bool]()
         monitor.onLevelChanged = { levels.append($0) }
         monitor.onSpeechActivityChanged = { activityChanges.append($0) }
 
         #expect(monitor.start() == .started)
-        #expect(inputNode.lastInstalledFormat == audioFormat)
 
-        let buffer = try #require(makeInt16Buffer(samples: [20_000, -20_000, 18_000, -18_000], format: audioFormat))
-        inputNode.emit(buffer: buffer)
+        let sample = SpeechAudioSample(
+            rms: 0.62,
+            format: makeAudioFormat(),
+            frameLength: 1_024
+        )
+        capture.emit(sample: sample)
         await Task.yield()
-        inputNode.emit(buffer: buffer)
+        capture.emit(sample: sample)
         await Task.yield()
 
         #expect(levels.contains(where: { $0 > 0 }))
@@ -105,59 +110,45 @@ struct SpeechActivityMonitorTests {
     }
 
     @Test
-    func stopRemovesTapResetsLevelAndClosesSpeechActivity() async throws {
+    func stopStopsCaptureResetsLevelAndClosesSpeechActivity() async {
         let permissionController = TestMicrophonePermissionController(status: .authorized)
-        let audioFormat = try #require(makeAudioFormat(commonFormat: .pcmFormatFloat32))
-        let inputNode = TestSpeechAudioInputNode(
-            liveFormat: SpeechAudioInputFormat(audioFormat)
+        let capture = TestSpeechAudioCaptureController()
+        let monitor = SpeechActivityMonitor(
+            audioSourceResolver: TestSpeechAudioSourceResolver(result: .resolved(device: makeCaptureDevice())),
+            audioCapture: capture,
+            permissionController: permissionController
         )
-        let engine = TestSpeechAudioEngine(inputNode: inputNode)
-        let monitor = SpeechActivityMonitor(audioEngine: engine, permissionController: permissionController)
         var levels = [Float]()
         var activityChanges = [Bool]()
         monitor.onLevelChanged = { levels.append($0) }
         monitor.onSpeechActivityChanged = { activityChanges.append($0) }
 
         #expect(monitor.start() == .started)
-
-        let buffer = try #require(makeFloat32Buffer(samples: [0.7, -0.7, 0.6, -0.6], format: audioFormat))
-        inputNode.emit(buffer: buffer)
+        capture.emit(sample: SpeechAudioSample(rms: 0.7, format: makeAudioFormat(), frameLength: 1_024))
         await Task.yield()
-        inputNode.emit(buffer: buffer)
+        capture.emit(sample: SpeechAudioSample(rms: 0.7, format: makeAudioFormat(), frameLength: 1_024))
         await Task.yield()
 
         monitor.stop()
 
-        #expect(inputNode.removeTapCallCount == 2)
-        #expect(engine.stopCallCount == 1)
-        #expect(engine.resetCallCount == 1)
+        #expect(capture.stopCapturingCallCount == 1)
         #expect(levels.last == 0)
         #expect(activityChanges.last == false)
     }
 
     @Test
-    func engineConfigurationChangeForwardsTheCallback() async {
+    func captureRuntimeIssueForwardsTheCallback() async {
         let permissionController = TestMicrophonePermissionController(status: .authorized)
-        let inputNode = TestSpeechAudioInputNode(
-            liveFormat: SpeechAudioInputFormat(
-                sampleRate: 44_100,
-                channelCount: 1,
-                commonFormat: .pcmFormatFloat32,
-                isInterleaved: false,
-                audioFormat: nil
-            )
-        )
-        let engine = TestSpeechAudioEngine(inputNode: inputNode)
-        let notificationCenter = NotificationCenter()
+        let capture = TestSpeechAudioCaptureController()
         let monitor = SpeechActivityMonitor(
-            audioEngine: engine,
-            permissionController: permissionController,
-            notificationCenter: notificationCenter
+            audioSourceResolver: TestSpeechAudioSourceResolver(result: .resolved(device: makeCaptureDevice())),
+            audioCapture: capture,
+            permissionController: permissionController
         )
         var callbackCount = 0
-        monitor.onEngineConfigurationChanged = { callbackCount += 1 }
+        monitor.onCaptureRuntimeIssue = { callbackCount += 1 }
 
-        engine.emitConfigurationChange(notificationCenter: notificationCenter)
+        capture.emitRuntimeIssue()
         await Task.yield()
 
         #expect(callbackCount == 1)
@@ -189,127 +180,64 @@ private final class TestMicrophonePermissionController: MicrophonePermissionCont
     }
 }
 
-private final class TestSpeechAudioInputNode: SpeechAudioInputNodeControlling {
-    var liveFormat: SpeechAudioInputFormat
+private struct TestSpeechAudioSourceResolver: SpeechAudioSourceResolving {
+    let result: SpeechAudioSourceResolution
 
-    private(set) var installTapCallCount = 0
-    private(set) var removeTapCallCount = 0
-    private(set) var lastInstalledFormat: AVAudioFormat?
-    private var tapBlock: AVAudioNodeTapBlock?
-
-    init(liveFormat: SpeechAudioInputFormat) {
-        self.liveFormat = liveFormat
+    init(result: SpeechAudioSourceResolution = .resolved(device: makeCaptureDevice())) {
+        self.result = result
     }
 
-    func installTap(
-        onBus _: AVAudioNodeBus,
-        bufferSize _: AVAudioFrameCount,
-        format: AVAudioFormat?,
-        block: @escaping AVAudioNodeTapBlock
-    ) {
-        installTapCallCount += 1
-        lastInstalledFormat = format
-        tapBlock = block
-    }
-
-    func removeTap(onBus _: AVAudioNodeBus) {
-        removeTapCallCount += 1
-        tapBlock = nil
-    }
-
-    func emit(buffer: AVAudioPCMBuffer) {
-        tapBlock?(buffer, AVAudioTime())
+    func resolveAudioSource() -> SpeechAudioSourceResolution {
+        result
     }
 }
 
-private final class TestSpeechAudioEngine: SpeechAudioEngineControlling {
-    let configurationChangeNotificationObject: AnyObject
-    let inputNode: SpeechAudioInputNodeControlling
+private final class TestSpeechAudioCaptureController: SpeechAudioCapturing {
+    var onAudioSample: ((SpeechAudioSample) -> Void)?
+    var onCaptureRuntimeIssue: (() -> Void)?
 
-    private(set) var prepareCallCount = 0
-    private(set) var startCallCount = 0
-    private(set) var stopCallCount = 0
-    private(set) var resetCallCount = 0
-    var startError: (any Error)?
+    private(set) var startCapturingCallCount = 0
+    private(set) var stopCapturingCallCount = 0
+    private(set) var lastStartedDevice: SpeechCaptureDeviceDescriptor?
 
-    init(inputNode: SpeechAudioInputNodeControlling) {
-        self.configurationChangeNotificationObject = NSObject()
-        self.inputNode = inputNode
+    private let startResult: Bool
+
+    init(startResult: Bool = true) {
+        self.startResult = startResult
     }
 
-    func prepare() {
-        prepareCallCount += 1
+    func startCapturing(device: SpeechCaptureDeviceDescriptor) -> Bool {
+        startCapturingCallCount += 1
+        lastStartedDevice = device
+        return startResult
     }
 
-    func start() throws {
-        startCallCount += 1
-        if let startError {
-            throw startError
-        }
+    func stopCapturing() {
+        stopCapturingCallCount += 1
     }
 
-    func stop() {
-        stopCallCount += 1
+    func emit(sample: SpeechAudioSample) {
+        onAudioSample?(sample)
     }
 
-    func reset() {
-        resetCallCount += 1
-    }
-
-    func emitConfigurationChange(notificationCenter: NotificationCenter) {
-        notificationCenter.post(
-            name: NSNotification.Name.AVAudioEngineConfigurationChange,
-            object: configurationChangeNotificationObject
-        )
+    func emitRuntimeIssue() {
+        onCaptureRuntimeIssue?()
     }
 }
 
-private func makeAudioFormat(
-    commonFormat: AVAudioCommonFormat,
-    sampleRate: Double = 44_100,
-    channels: AVAudioChannelCount = 1,
-    interleaved: Bool = false
-) -> AVAudioFormat? {
-    AVAudioFormat(
-        commonFormat: commonFormat,
-        sampleRate: sampleRate,
-        channels: channels,
-        interleaved: interleaved
+private func makeAudioFormat() -> SpeechAudioInputFormat {
+    SpeechAudioInputFormat(
+        sampleRate: 44_100,
+        channelCount: 1,
+        commonFormat: .pcmFormatFloat32,
+        isInterleaved: false,
+        audioFormat: nil
     )
 }
 
-private func makeFloat32Buffer(samples: [Float], format: AVAudioFormat) -> AVAudioPCMBuffer? {
-    let buffer = AVAudioPCMBuffer(
-        pcmFormat: format,
-        frameCapacity: AVAudioFrameCount(samples.count)
+private func makeCaptureDevice() -> SpeechCaptureDeviceDescriptor {
+    SpeechCaptureDeviceDescriptor(
+        localizedName: "MacBook Air Microphone",
+        uniqueID: "BuiltInMicrophoneDevice"
     )
-    buffer?.frameLength = AVAudioFrameCount(samples.count)
-
-    guard let channelData = buffer?.floatChannelData else {
-        return nil
-    }
-
-    for (index, sample) in samples.enumerated() {
-        channelData[0][index] = sample
-    }
-
-    return buffer
-}
-
-private func makeInt16Buffer(samples: [Int16], format: AVAudioFormat) -> AVAudioPCMBuffer? {
-    let buffer = AVAudioPCMBuffer(
-        pcmFormat: format,
-        frameCapacity: AVAudioFrameCount(samples.count)
-    )
-    buffer?.frameLength = AVAudioFrameCount(samples.count)
-
-    guard let channelData = buffer?.int16ChannelData else {
-        return nil
-    }
-
-    for (index, sample) in samples.enumerated() {
-        channelData[0][index] = sample
-    }
-
-    return buffer
 }

@@ -1,6 +1,8 @@
 // Monitors microphone input and emits speech activity changes.
 import AppKit
+import AudioToolbox
 import AVFoundation
+import CoreMedia
 import Foundation
 
 enum SpeechMonitoringStartResult: Equatable {
@@ -8,6 +10,7 @@ enum SpeechMonitoringStartResult: Equatable {
     case permissionPending
     case denied
     case unavailable
+    case unresolvedSource(String)
 }
 
 protocol MicrophonePermissionControlling {
@@ -55,82 +58,355 @@ struct SpeechAudioInputFormat {
             audioFormat: format
         )
     }
+
+    init?(streamDescription: AudioStreamBasicDescription) {
+        guard streamDescription.mFormatID == kAudioFormatLinearPCM else {
+            return nil
+        }
+
+        let formatFlags = streamDescription.mFormatFlags
+        let isFloat = (formatFlags & kAudioFormatFlagIsFloat) != 0
+        let isInterleaved = (formatFlags & kAudioFormatFlagIsNonInterleaved) == 0
+
+        let commonFormat: AVAudioCommonFormat
+        switch (isFloat, streamDescription.mBitsPerChannel) {
+        case (true, 32):
+            commonFormat = .pcmFormatFloat32
+        case (true, 64):
+            commonFormat = .pcmFormatFloat64
+        case (false, 16):
+            commonFormat = .pcmFormatInt16
+        case (false, 32):
+            commonFormat = .pcmFormatInt32
+        default:
+            return nil
+        }
+
+        self.init(
+            sampleRate: streamDescription.mSampleRate,
+            channelCount: streamDescription.mChannelsPerFrame,
+            commonFormat: commonFormat,
+            isInterleaved: isInterleaved,
+            audioFormat: nil
+        )
+    }
 }
 
-protocol SpeechAudioInputNodeControlling: AnyObject {
-    var liveFormat: SpeechAudioInputFormat { get }
-
-    func installTap(
-        onBus bus: AVAudioNodeBus,
-        bufferSize: AVAudioFrameCount,
-        format: AVAudioFormat?,
-        block: @escaping AVAudioNodeTapBlock
-    )
-    func removeTap(onBus bus: AVAudioNodeBus)
+struct SpeechAudioSample {
+    let rms: Float
+    let format: SpeechAudioInputFormat
+    let frameLength: Int
 }
 
-protocol SpeechAudioEngineControlling: AnyObject {
-    var configurationChangeNotificationObject: AnyObject { get }
-    var inputNode: SpeechAudioInputNodeControlling { get }
+protocol SpeechAudioCapturing: AnyObject {
+    var onAudioSample: ((SpeechAudioSample) -> Void)? { get set }
+    var onCaptureRuntimeIssue: (() -> Void)? { get set }
 
-    func prepare()
-    func start() throws
-    func stop()
-    func reset()
+    func startCapturing(device: SpeechCaptureDeviceDescriptor) -> Bool
+    func stopCapturing()
 }
 
-private final class AVAudioInputNodeController: SpeechAudioInputNodeControlling {
-    private let inputNode: AVAudioInputNode
+private final class AVCaptureSpeechAudioCaptureController: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate, SpeechAudioCapturing {
+    var onAudioSample: ((SpeechAudioSample) -> Void)?
+    var onCaptureRuntimeIssue: (() -> Void)?
 
-    init(inputNode: AVAudioInputNode) {
-        self.inputNode = inputNode
+    private let notificationCenter: NotificationCenter
+    private let sampleBufferQueue = DispatchQueue(label: "dev.local.Yappy.speechCapture.audio")
+    private let stateQueue = DispatchQueue(label: "dev.local.Yappy.speechCapture.state")
+    private var captureSession: AVCaptureSession?
+    private var runtimeObservers = [NSObjectProtocol]()
+    private var activeSessionToken: UUID?
+
+    init(notificationCenter: NotificationCenter = .default) {
+        self.notificationCenter = notificationCenter
     }
 
-    var liveFormat: SpeechAudioInputFormat {
-        SpeechAudioInputFormat(inputNode.inputFormat(forBus: 0))
+    func startCapturing(device: SpeechCaptureDeviceDescriptor) -> Bool {
+        stopCapturing()
+
+        let matchingDevices = discoverAudioInputDevices().filter { $0.uniqueID == device.uniqueID }
+
+        guard matchingDevices.count == 1, let selectedDevice = matchingDevices.first else {
+            return false
+        }
+
+        let session = AVCaptureSession()
+        let sessionToken = UUID()
+        let output = AVCaptureAudioDataOutput()
+        output.setSampleBufferDelegate(self, queue: sampleBufferQueue)
+
+        do {
+            let input = try AVCaptureDeviceInput(device: selectedDevice)
+            session.beginConfiguration()
+
+            guard session.canAddInput(input), session.canAddOutput(output) else {
+                session.commitConfiguration()
+                return false
+            }
+
+            session.addInput(input)
+            session.addOutput(output)
+            session.commitConfiguration()
+        } catch {
+            return false
+        }
+
+        updateActiveSessionToken(sessionToken)
+        captureSession = session
+        installRuntimeObservers(for: session, sessionToken: sessionToken)
+        session.startRunning()
+
+        guard session.isRunning else {
+            stopCapturing()
+            return false
+        }
+
+        return true
     }
 
-    func installTap(
-        onBus bus: AVAudioNodeBus,
-        bufferSize: AVAudioFrameCount,
-        format: AVAudioFormat?,
-        block: @escaping AVAudioNodeTapBlock
+    func stopCapturing() {
+        clearActiveSessionToken()
+        removeRuntimeObservers()
+
+        guard let captureSession else {
+            return
+        }
+
+        self.captureSession = nil
+        if captureSession.isRunning {
+            captureSession.stopRunning()
+        }
+    }
+
+    func captureOutput(
+        _: AVCaptureOutput,
+        didOutput sampleBuffer: CMSampleBuffer,
+        from _: AVCaptureConnection
     ) {
-        inputNode.installTap(onBus: bus, bufferSize: bufferSize, format: format, block: block)
+        guard hasActiveCaptureSession,
+              let sample = Self.makeSample(from: sampleBuffer)
+        else {
+            return
+        }
+
+        onAudioSample?(sample)
     }
 
-    func removeTap(onBus bus: AVAudioNodeBus) {
-        inputNode.removeTap(onBus: bus)
-    }
-}
-
-private final class AVAudioEngineController: SpeechAudioEngineControlling {
-    private let engine: AVAudioEngine
-    let inputNode: SpeechAudioInputNodeControlling
-
-    init(engine: AVAudioEngine) {
-        self.engine = engine
-        self.inputNode = AVAudioInputNodeController(inputNode: engine.inputNode)
+    private func discoverAudioInputDevices() -> [AVCaptureDevice] {
+        AVCaptureDevice.DiscoverySession(
+            deviceTypes: supportedDeviceTypes(),
+            mediaType: .audio,
+            position: .unspecified
+        ).devices
     }
 
-    var configurationChangeNotificationObject: AnyObject {
-        engine
+    private func supportedDeviceTypes() -> [AVCaptureDevice.DeviceType] {
+        if #available(macOS 14.0, *) {
+            return [.microphone, .external]
+        }
+
+        return [.builtInMicrophone, .externalUnknown]
     }
 
-    func prepare() {
-        engine.prepare()
+    private func installRuntimeObservers(for session: AVCaptureSession, sessionToken: UUID) {
+        runtimeObservers = [
+            notificationCenter.addObserver(
+                forName: NSNotification.Name.AVCaptureSessionRuntimeError,
+                object: session,
+                queue: nil
+            ) { [weak self] _ in
+                self?.notifyCaptureRuntimeIssueIfCurrent(sessionToken: sessionToken)
+            },
+            notificationCenter.addObserver(
+                forName: NSNotification.Name.AVCaptureSessionWasInterrupted,
+                object: session,
+                queue: nil
+            ) { [weak self] _ in
+                self?.notifyCaptureRuntimeIssueIfCurrent(sessionToken: sessionToken)
+            }
+        ]
     }
 
-    func start() throws {
-        try engine.start()
+    private func removeRuntimeObservers() {
+        runtimeObservers.forEach(notificationCenter.removeObserver)
+        runtimeObservers.removeAll(keepingCapacity: false)
     }
 
-    func stop() {
-        engine.stop()
+    private func notifyCaptureRuntimeIssueIfCurrent(sessionToken: UUID) {
+        guard isCurrentSessionToken(sessionToken) else {
+            return
+        }
+
+        onCaptureRuntimeIssue?()
     }
 
-    func reset() {
-        engine.reset()
+    private var hasActiveCaptureSession: Bool {
+        stateQueue.sync { activeSessionToken != nil }
+    }
+
+    private func updateActiveSessionToken(_ token: UUID) {
+        stateQueue.sync {
+            activeSessionToken = token
+        }
+    }
+
+    private func clearActiveSessionToken() {
+        stateQueue.sync {
+            activeSessionToken = nil
+        }
+    }
+
+    private func isCurrentSessionToken(_ token: UUID) -> Bool {
+        stateQueue.sync { activeSessionToken == token }
+    }
+
+    private static func makeSample(from sampleBuffer: CMSampleBuffer) -> SpeechAudioSample? {
+        guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let streamDescriptionPointer = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription)
+        else {
+            return nil
+        }
+
+        let streamDescription = streamDescriptionPointer.pointee
+        guard let format = SpeechAudioInputFormat(streamDescription: streamDescription) else {
+            return nil
+        }
+
+        let frameLength = Int(CMSampleBufferGetNumSamples(sampleBuffer))
+        guard frameLength > 0 else {
+            return SpeechAudioSample(rms: 0, format: format, frameLength: 0)
+        }
+
+        let bufferListSize = MemoryLayout<AudioBufferList>.size
+            + (max(1, Int(format.channelCount)) - 1) * MemoryLayout<AudioBuffer>.size
+        let bufferListPointer = UnsafeMutableRawPointer.allocate(
+            byteCount: bufferListSize,
+            alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        defer { bufferListPointer.deallocate() }
+
+        let audioBufferList = bufferListPointer.assumingMemoryBound(to: AudioBufferList.self)
+        var blockBuffer: CMBlockBuffer?
+        let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: nil,
+            bufferListOut: audioBufferList,
+            bufferListSize: bufferListSize,
+            blockBufferAllocator: kCFAllocatorDefault,
+            blockBufferMemoryAllocator: kCFAllocatorDefault,
+            flags: UInt32(kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment),
+            blockBufferOut: &blockBuffer
+        )
+
+        guard status == noErr else {
+            return nil
+        }
+
+        let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
+        let rms = rms(from: buffers, format: format, frameLength: frameLength)
+        return SpeechAudioSample(rms: rms, format: format, frameLength: frameLength)
+    }
+
+    private static func rms(
+        from buffers: UnsafeMutableAudioBufferListPointer,
+        format: SpeechAudioInputFormat,
+        frameLength: Int
+    ) -> Float {
+        let channelCount = Int(format.channelCount)
+        guard channelCount > 0, frameLength > 0 else {
+            return 0
+        }
+
+        switch format.commonFormat {
+        case .pcmFormatFloat32:
+            if format.isInterleaved, let buffer = buffers.first, let data = buffer.mData?.assumingMemoryBound(to: Float.self) {
+                return rms(frameCount: frameLength, channelCount: channelCount) { channelIndex, frameIndex in
+                    data[(frameIndex * channelCount) + channelIndex]
+                }
+            }
+
+            return rms(frameCount: frameLength, channelCount: channelCount) { channelIndex, frameIndex in
+                guard channelIndex < buffers.count,
+                      let data = buffers[channelIndex].mData?.assumingMemoryBound(to: Float.self)
+                else {
+                    return 0
+                }
+
+                return data[frameIndex]
+            }
+        case .pcmFormatFloat64:
+            if format.isInterleaved, let buffer = buffers.first, let data = buffer.mData?.assumingMemoryBound(to: Double.self) {
+                return rms(frameCount: frameLength, channelCount: channelCount) { channelIndex, frameIndex in
+                    Float(data[(frameIndex * channelCount) + channelIndex])
+                }
+            }
+
+            return rms(frameCount: frameLength, channelCount: channelCount) { channelIndex, frameIndex in
+                guard channelIndex < buffers.count,
+                      let data = buffers[channelIndex].mData?.assumingMemoryBound(to: Double.self)
+                else {
+                    return 0
+                }
+
+                return Float(data[frameIndex])
+            }
+        case .pcmFormatInt16:
+            if format.isInterleaved, let buffer = buffers.first, let data = buffer.mData?.assumingMemoryBound(to: Int16.self) {
+                return rms(frameCount: frameLength, channelCount: channelCount) { channelIndex, frameIndex in
+                    Float(data[(frameIndex * channelCount) + channelIndex]) / Float(Int16.max)
+                }
+            }
+
+            return rms(frameCount: frameLength, channelCount: channelCount) { channelIndex, frameIndex in
+                guard channelIndex < buffers.count,
+                      let data = buffers[channelIndex].mData?.assumingMemoryBound(to: Int16.self)
+                else {
+                    return 0
+                }
+
+                return Float(data[frameIndex]) / Float(Int16.max)
+            }
+        case .pcmFormatInt32:
+            if format.isInterleaved, let buffer = buffers.first, let data = buffer.mData?.assumingMemoryBound(to: Int32.self) {
+                return rms(frameCount: frameLength, channelCount: channelCount) { channelIndex, frameIndex in
+                    Float(data[(frameIndex * channelCount) + channelIndex]) / Float(Int32.max)
+                }
+            }
+
+            return rms(frameCount: frameLength, channelCount: channelCount) { channelIndex, frameIndex in
+                guard channelIndex < buffers.count,
+                      let data = buffers[channelIndex].mData?.assumingMemoryBound(to: Int32.self)
+                else {
+                    return 0
+                }
+
+                return Float(data[frameIndex]) / Float(Int32.max)
+            }
+        case .otherFormat:
+            return 0
+        @unknown default:
+            return 0
+        }
+    }
+
+    private static func rms(
+        frameCount: Int,
+        channelCount: Int,
+        sampleAt: (_ channelIndex: Int, _ frameIndex: Int) -> Float
+    ) -> Float {
+        var sumSquares: Float = 0
+
+        for channelIndex in 0 ..< channelCount {
+            var channelSum: Float = 0
+            for frameIndex in 0 ..< frameCount {
+                let sample = sampleAt(channelIndex, frameIndex)
+                channelSum += sample * sample
+            }
+
+            sumSquares += channelSum / Float(frameCount)
+        }
+
+        return sqrt(sumSquares / Float(channelCount))
     }
 }
 
@@ -139,7 +415,7 @@ protocol SpeechActivityMonitoring: AnyObject {
     var onSpeechActivityChanged: ((Bool) -> Void)? { get set }
     var onLevelChanged: ((Float) -> Void)? { get set }
     var onPermissionResolved: ((Bool) -> Void)? { get set }
-    var onEngineConfigurationChanged: (() -> Void)? { get set }
+    var onCaptureRuntimeIssue: (() -> Void)? { get set }
 
     func requestMicrophoneAccessIfNeeded() -> Bool?
     func start() -> SpeechMonitoringStartResult
@@ -174,29 +450,38 @@ final class SpeechActivityMonitor: SpeechActivityMonitoring {
     var onSpeechActivityChanged: ((Bool) -> Void)?
     var onLevelChanged: ((Float) -> Void)?
     var onPermissionResolved: ((Bool) -> Void)?
-    var onEngineConfigurationChanged: (() -> Void)?
+    var onCaptureRuntimeIssue: (() -> Void)?
 
-    private static let inputBus: AVAudioNodeBus = 0
-    private static let tapBufferSize: AVAudioFrameCount = 1_024
-
-    private let audioEngine: SpeechAudioEngineControlling
+    private let audioSourceResolver: SpeechAudioSourceResolving
+    private let audioCapture: SpeechAudioCapturing
     private let permissionController: MicrophonePermissionControlling
-    private let notificationCenter: NotificationCenter
-    private var engineConfigurationObserver: NSObjectProtocol?
     private var gate: SpeechLevelGate
     private var meter: SpeechLevelMeter
     private var isPermissionRequestInFlight = false
     private var isRunning = false
+    private var hasLoggedFirstSample = false
     private var hasLoggedFirstNonZeroLevel = false
 
     convenience init(
-        engine: AVAudioEngine = AVAudioEngine(),
         gate: SpeechLevelGate = SpeechLevelGate(),
         meter: SpeechLevelMeter = SpeechLevelMeter(),
         permissionController: MicrophonePermissionControlling = AVFoundationMicrophonePermissionController()
     ) {
+        let providers: [DictationAudioSourceProviding] = [
+            WisprFlowAudioSourceProvider(),
+            WillowVoiceAudioSourceProvider()
+        ]
+        let activationTracker = WorkspaceDictationAppActivationTracker(
+            supportedBundleIdentifiers: Set(providers.map(\.bundleIdentifier))
+        )
         self.init(
-            audioEngine: AVAudioEngineController(engine: engine),
+            audioSourceResolver: DictationAudioSourceResolver(
+                providerRegistry: DictationAudioSourceProviderRegistry(
+                    providers: providers,
+                    activationTracker: activationTracker
+                )
+            ),
+            audioCapture: AVCaptureSpeechAudioCaptureController(),
             gate: gate,
             meter: meter,
             permissionController: permissionController
@@ -204,32 +489,29 @@ final class SpeechActivityMonitor: SpeechActivityMonitoring {
     }
 
     init(
-        audioEngine: SpeechAudioEngineControlling,
+        audioSourceResolver: SpeechAudioSourceResolving,
+        audioCapture: SpeechAudioCapturing,
         gate: SpeechLevelGate = SpeechLevelGate(),
         meter: SpeechLevelMeter = SpeechLevelMeter(),
-        permissionController: MicrophonePermissionControlling = AVFoundationMicrophonePermissionController(),
-        notificationCenter: NotificationCenter = .default
+        permissionController: MicrophonePermissionControlling = AVFoundationMicrophonePermissionController()
     ) {
-        self.audioEngine = audioEngine
+        self.audioSourceResolver = audioSourceResolver
+        self.audioCapture = audioCapture
         self.permissionController = permissionController
-        self.notificationCenter = notificationCenter
         self.gate = gate
         self.meter = meter
-        engineConfigurationObserver = notificationCenter.addObserver(
-            forName: NSNotification.Name.AVAudioEngineConfigurationChange,
-            object: audioEngine.configurationChangeNotificationObject,
-            queue: nil
-        ) { [weak self] _ in
-            Self.writeDebugLog("audio engine configuration changed")
+
+        audioCapture.onAudioSample = { [weak self] sample in
             Task { @MainActor [weak self] in
-                self?.onEngineConfigurationChanged?()
+                self?.handle(sample: sample)
             }
         }
-    }
 
-    deinit {
-        if let engineConfigurationObserver {
-            notificationCenter.removeObserver(engineConfigurationObserver)
+        audioCapture.onCaptureRuntimeIssue = { [weak self] in
+            Self.writeDebugLog("capture runtime issue")
+            Task { @MainActor [weak self] in
+                self?.onCaptureRuntimeIssue?()
+            }
         }
     }
 
@@ -263,85 +545,35 @@ final class SpeechActivityMonitor: SpeechActivityMonitoring {
             return .started
         }
 
-        let inputNode = audioEngine.inputNode
-        let inputFormat = inputNode.liveFormat
-        guard inputFormat.channelCount > 0 else {
-            debugLog("microphone input unavailable: zero-channel hardware format")
-            return .unavailable
-        }
+        switch audioSourceResolver.resolveAudioSource() {
+        case let .unresolved(message):
+            resetLevelState()
+            debugLog("speech source unresolved message=\(message)")
+            return .unresolvedSource(message)
+        case let .resolved(device):
+            resetLevelState()
+            debugLog("starting audio capture device=\(device.localizedName) id=\(device.uniqueID)")
 
-        guard inputFormat.sampleRate > 0 else {
-            debugLog("microphone input unavailable: zero-sample-rate hardware format")
-            return .unavailable
-        }
-
-        guard let tapFormat = inputFormat.audioFormat else {
-            debugLog("microphone input unavailable: missing live input format")
-            return .unavailable
-        }
-
-        _ = gate.reset()
-        _ = meter.reset()
-        hasLoggedFirstNonZeroLevel = false
-        onLevelChanged?(0)
-        inputNode.removeTap(onBus: Self.inputBus)
-
-        var hasLoggedFirstTapCallback = false
-        inputNode.installTap(onBus: Self.inputBus, bufferSize: Self.tapBufferSize, format: tapFormat) { [weak self] buffer, _ in
-            guard let self else {
-                return
+            guard audioCapture.startCapturing(device: device) else {
+                audioCapture.stopCapturing()
+                isRunning = false
+                debugLog("audio capture failed to start device=\(device.localizedName) id=\(device.uniqueID)")
+                return .unavailable
             }
 
-            if !hasLoggedFirstTapCallback {
-                hasLoggedFirstTapCallback = true
-                Self.writeDebugLog(
-                    "first tap callback frameLength=\(buffer.frameLength) format=\(Self.describe(SpeechAudioInputFormat(buffer.format)))"
-                )
-            }
-
-            let rms = Self.rms(from: buffer)
-            Task { @MainActor in
-                self.handle(rms: rms)
-            }
-        }
-
-        debugLog("starting audio engine format=\(Self.describe(inputFormat)) bufferSize=\(Self.tapBufferSize)")
-        audioEngine.prepare()
-
-        do {
-            try audioEngine.start()
             isRunning = true
-            debugLog("audio engine started format=\(Self.describe(inputFormat)) bufferSize=\(Self.tapBufferSize)")
+            debugLog("audio capture started device=\(device.localizedName) id=\(device.uniqueID)")
             return .started
-        } catch {
-            inputNode.removeTap(onBus: Self.inputBus)
-            audioEngine.stop()
-            audioEngine.reset()
-            isRunning = false
-            debugLog(
-                "audio engine failed to start format=\(Self.describe(inputFormat)) error=\(error.localizedDescription)"
-            )
-            return .unavailable
         }
     }
 
     func stop() {
-        let inputNode = audioEngine.inputNode
         if isRunning {
-            inputNode.removeTap(onBus: Self.inputBus)
-            audioEngine.stop()
-            audioEngine.reset()
+            audioCapture.stopCapturing()
             isRunning = false
         }
 
-        hasLoggedFirstNonZeroLevel = false
-        _ = meter.reset()
-        onLevelChanged?(0)
-
-        if gate.reset() {
-            onSpeechActivityChanged?(false)
-        }
-
+        resetLevelState()
         debugLog("stopped")
     }
 
@@ -355,8 +587,15 @@ final class SpeechActivityMonitor: SpeechActivityMonitoring {
         NSWorkspace.shared.openApplication(at: settingsURL, configuration: NSWorkspace.OpenConfiguration())
     }
 
-    private func handle(rms: Float) {
-        let normalizedLevel = meter.process(rms: rms)
+    private func handle(sample: SpeechAudioSample) {
+        if !hasLoggedFirstSample {
+            hasLoggedFirstSample = true
+            Self.writeDebugLog(
+                "first capture sample frameLength=\(sample.frameLength) format=\(Self.describe(sample.format))"
+            )
+        }
+
+        let normalizedLevel = meter.process(rms: sample.rms)
         onLevelChanged?(normalizedLevel)
 
         if normalizedLevel > 0, !hasLoggedFirstNonZeroLevel {
@@ -366,6 +605,17 @@ final class SpeechActivityMonitor: SpeechActivityMonitoring {
 
         if let isSpeechActive = gate.process(level: normalizedLevel) {
             onSpeechActivityChanged?(isSpeechActive)
+        }
+    }
+
+    private func resetLevelState() {
+        hasLoggedFirstSample = false
+        hasLoggedFirstNonZeroLevel = false
+        _ = meter.reset()
+        onLevelChanged?(0)
+
+        if gate.reset() {
+            onSpeechActivityChanged?(false)
         }
     }
 
@@ -399,98 +649,6 @@ final class SpeechActivityMonitor: SpeechActivityMonitoring {
         print(line)
         DebugTrace.log(line)
         #endif
-    }
-
-    private static func rms(from buffer: AVAudioPCMBuffer) -> Float {
-        let frameCount = Int(buffer.frameLength)
-        let channelCount = Int(buffer.format.channelCount)
-        guard frameCount > 0, channelCount > 0 else {
-            return 0
-        }
-
-        switch buffer.format.commonFormat {
-        case .pcmFormatFloat32:
-            guard let channels = buffer.floatChannelData else {
-                return 0
-            }
-            let stride = Int(buffer.stride)
-            if buffer.format.isInterleaved {
-                let interleavedSamples = channels[0]
-                return rms(
-                    frameCount: frameCount,
-                    channelCount: channelCount
-                ) { channelIndex, frameIndex in
-                    interleavedSamples[(frameIndex * stride) + channelIndex]
-                }
-            }
-            return rms(
-                frameCount: frameCount,
-                channelCount: channelCount
-            ) { channelIndex, frameIndex in
-                channels[channelIndex][frameIndex * stride]
-            }
-        case .pcmFormatInt16:
-            guard let channels = buffer.int16ChannelData else {
-                return 0
-            }
-            let stride = Int(buffer.stride)
-            if buffer.format.isInterleaved {
-                let interleavedSamples = channels[0]
-                return rms(
-                    frameCount: frameCount,
-                    channelCount: channelCount
-                ) { channelIndex, frameIndex in
-                    Float(interleavedSamples[(frameIndex * stride) + channelIndex]) / Float(Int16.max)
-                }
-            }
-            return rms(
-                frameCount: frameCount,
-                channelCount: channelCount
-            ) { channelIndex, frameIndex in
-                Float(channels[channelIndex][frameIndex * stride]) / Float(Int16.max)
-            }
-        case .pcmFormatInt32:
-            guard let channels = buffer.int32ChannelData else {
-                return 0
-            }
-            let stride = Int(buffer.stride)
-            if buffer.format.isInterleaved {
-                let interleavedSamples = channels[0]
-                return rms(
-                    frameCount: frameCount,
-                    channelCount: channelCount
-                ) { channelIndex, frameIndex in
-                    Float(interleavedSamples[(frameIndex * stride) + channelIndex]) / Float(Int32.max)
-                }
-            }
-            return rms(
-                frameCount: frameCount,
-                channelCount: channelCount
-            ) { channelIndex, frameIndex in
-                Float(channels[channelIndex][frameIndex * stride]) / Float(Int32.max)
-            }
-        default:
-            return 0
-        }
-    }
-
-    private static func rms(
-        frameCount: Int,
-        channelCount: Int,
-        sampleAt: (_ channelIndex: Int, _ frameIndex: Int) -> Float
-    ) -> Float {
-        var sumSquares: Float = 0
-
-        for channelIndex in 0 ..< channelCount {
-            var channelSum: Float = 0
-            for frameIndex in 0 ..< frameCount {
-                let sample = sampleAt(channelIndex, frameIndex)
-                channelSum += sample * sample
-            }
-            sumSquares += channelSum / Float(frameCount)
-        }
-
-        return sqrt(sumSquares / Float(channelCount))
     }
 
     private static func describe(_ format: SpeechAudioInputFormat) -> String {

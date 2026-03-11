@@ -9,6 +9,7 @@ protocol StatusItemControlling: AnyObject {
     var onQuit: (() -> Void)? { get set }
 
     func updateEnabled(_ enabled: Bool)
+    func updateSpeechSourceWarning(_ message: String?)
 }
 
 @MainActor
@@ -20,6 +21,8 @@ final class StatusItemController: NSObject, StatusItemControlling {
 
     private let statusItem: NSStatusItem
     private let enabledItem = NSMenuItem(title: "Enabled", action: nil, keyEquivalent: "")
+    private let speechSourceWarningItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    private let speechSourceWarningSeparator = NSMenuItem.separator()
     private var isEnabled = true
 
     override init() {
@@ -33,6 +36,9 @@ final class StatusItemController: NSObject, StatusItemControlling {
 
         enabledItem.target = self
         enabledItem.action = #selector(toggleEnabled)
+        speechSourceWarningItem.isEnabled = false
+        speechSourceWarningItem.isHidden = true
+        speechSourceWarningSeparator.isHidden = true
 
         let recenterItem = NSMenuItem(title: "Recenter Overlay", action: #selector(recenterOverlay), keyEquivalent: "")
         recenterItem.target = self
@@ -45,6 +51,8 @@ final class StatusItemController: NSObject, StatusItemControlling {
 
         let menu = NSMenu()
         menu.addItem(enabledItem)
+        menu.addItem(speechSourceWarningItem)
+        menu.addItem(speechSourceWarningSeparator)
         menu.addItem(recenterItem)
         menu.addItem(permissionsItem)
         menu.addItem(.separator())
@@ -57,6 +65,14 @@ final class StatusItemController: NSObject, StatusItemControlling {
     func updateEnabled(_ enabled: Bool) {
         isEnabled = enabled
         enabledItem.state = enabled ? .on : .off
+    }
+
+    func updateSpeechSourceWarning(_ message: String?) {
+        let resolvedMessage = message?.trimmingCharacters(in: .whitespacesAndNewlines)
+        speechSourceWarningItem.title = resolvedMessage ?? ""
+        let isVisible = !(resolvedMessage?.isEmpty ?? true)
+        speechSourceWarningItem.isHidden = !isVisible
+        speechSourceWarningSeparator.isHidden = !isVisible
     }
 
     @objc

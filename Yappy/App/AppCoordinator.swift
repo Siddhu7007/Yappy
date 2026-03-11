@@ -15,11 +15,6 @@ final class AppCoordinator {
         static let maxAttempts = 3
     }
 
-    private enum HotkeyReleaseDefaults {
-        static let gracePeriodNanoseconds: UInt64 = 700_000_000
-        static let speechContinuationWindowNanoseconds: UInt64 = 3_000_000_000
-    }
-
     private let panelController: OverlayPanelControlling
     private let permissionAccess: InputMonitoringAccessing
     private let speechMonitor: SpeechActivityMonitoring
@@ -31,8 +26,6 @@ final class AppCoordinator {
     private let speechRecoverySignalVerificationDelayNanoseconds: UInt64
     private let speechRecoverySignalThreshold: Float
     private let maxSpeechRecoveryAttempts: Int
-    private let hotkeyReleaseGracePeriodNanoseconds: UInt64
-    private let hotkeyReleaseSpeechContinuationWindowNanoseconds: UInt64
 
     private var isEnabled = true
     private var isHotkeyHeld = false
@@ -46,8 +39,6 @@ final class AppCoordinator {
     private var isAwaitingInteractionSignal = false
     private var isAwaitingSpeechRecoverySignal = false
     private var lastMeasuredSpeechLevel: Float = 0
-    private var lastAudibleSpeechUptime: TimeInterval = 0
-    private var pendingHotkeyReleaseTask: Task<Void, Never>?
 
     init(
         positionStore: OverlayPositionStore? = nil,
@@ -61,9 +52,7 @@ final class AppCoordinator {
         interactionRecoveryDelayNanoseconds: UInt64 = 150_000_000,
         speechRecoverySignalVerificationDelayNanoseconds: UInt64 = SpeechRecoveryDefaults.signalVerificationDelayNanoseconds,
         speechRecoverySignalThreshold: Float = SpeechRecoveryDefaults.signalThreshold,
-        maxSpeechRecoveryAttempts: Int = SpeechRecoveryDefaults.maxAttempts,
-        hotkeyReleaseGracePeriodNanoseconds: UInt64 = HotkeyReleaseDefaults.gracePeriodNanoseconds,
-        hotkeyReleaseSpeechContinuationWindowNanoseconds: UInt64 = HotkeyReleaseDefaults.speechContinuationWindowNanoseconds
+        maxSpeechRecoveryAttempts: Int = SpeechRecoveryDefaults.maxAttempts
     ) {
         let resolvedPositionStore = positionStore ?? OverlayPositionStore()
         let resolvedPermissionAccess = permissionAccess ?? InputMonitoringAccess()
@@ -85,8 +74,6 @@ final class AppCoordinator {
         self.speechRecoverySignalVerificationDelayNanoseconds = speechRecoverySignalVerificationDelayNanoseconds
         self.speechRecoverySignalThreshold = speechRecoverySignalThreshold
         self.maxSpeechRecoveryAttempts = maxSpeechRecoveryAttempts
-        self.hotkeyReleaseGracePeriodNanoseconds = hotkeyReleaseGracePeriodNanoseconds
-        self.hotkeyReleaseSpeechContinuationWindowNanoseconds = hotkeyReleaseSpeechContinuationWindowNanoseconds
 
         resolvedStateMachine.onStateChange = { [weak self] state in
             self?.panelController.apply(state: state)
@@ -116,8 +103,8 @@ final class AppCoordinator {
             self?.handleSpeechPermissionResolved(granted)
         }
 
-        resolvedSpeechMonitor.onEngineConfigurationChanged = { [weak self] in
-            self?.handleSpeechRecoveryTrigger(.engineConfigurationChanged)
+        resolvedSpeechMonitor.onCaptureRuntimeIssue = { [weak self] in
+            self?.handleSpeechRecoveryTrigger(.captureRuntimeIssue)
         }
 
         resolvedStatusItemController.onToggleEnabled = { [weak self] enabled in
@@ -147,6 +134,7 @@ final class AppCoordinator {
         panelController.show()
         panelController.apply(state: stateMachine.state)
         statusItemController.updateEnabled(isEnabled)
+        statusItemController.updateSpeechSourceWarning(nil)
         interactionMonitor.start()
         startMonitoring(requestAccessIfNeeded: true)
         bootstrapMicrophoneAccess()
@@ -154,7 +142,6 @@ final class AppCoordinator {
 
     func stop() {
         stopPermissionPolling()
-        cancelPendingHotkeyRelease(reason: "app stop")
         cancelSpeechRecovery(reason: "app stop", resetAttemptState: true)
         resetHotkeySessionTracking()
         clearCoordinatorErrorState()
@@ -168,7 +155,6 @@ final class AppCoordinator {
 
         switch event {
         case .pressed:
-            cancelPendingHotkeyRelease(reason: "hotkey pressed")
             guard !isHotkeyHeld else {
                 return
             }
@@ -185,7 +171,7 @@ final class AppCoordinator {
                 return
             }
 
-            armHotkeyReleaseConfirmation()
+            finalizeHotkeyRelease()
         }
     }
 
@@ -220,7 +206,6 @@ final class AppCoordinator {
 
     private func disableCoordinator() {
         interactionMonitor.stop()
-        cancelPendingHotkeyRelease(reason: "disabled")
         cancelSpeechRecovery(reason: "disabled", resetAttemptState: true)
         stopPermissionPolling()
         resetHotkeySessionTracking()
@@ -268,7 +253,6 @@ final class AppCoordinator {
     private func handleInputMonitoringAccessWarning(_ message: String) {
         debugLog("Input Monitoring preflight missing; keeping hotkey monitoring active until a live Fn event or explicit grant")
         setCoordinatorErrorState(.inputMonitoring)
-        cancelPendingHotkeyRelease(reason: "input monitoring warning")
         resetHotkeySessionTracking()
         stopSpeechMonitoringAndResetVisuals()
         stateMachine.handle(.permissionDenied)
@@ -279,7 +263,6 @@ final class AppCoordinator {
     private func handleInputMonitoringAccessFailure(_ message: String) {
         debugLog("Input Monitoring missing; failing closed until access is granted")
         setCoordinatorErrorState(.inputMonitoring)
-        cancelPendingHotkeyRelease(reason: "input monitoring failure")
         resetHotkeySessionTracking()
         stopSpeechMonitoringAndResetVisuals()
         hotkeyMonitor.stop()
@@ -291,7 +274,6 @@ final class AppCoordinator {
 
     private func handleHotkeyMonitoringFailure(_ message: String) {
         setCoordinatorErrorState(.hotkeyMonitoring)
-        cancelPendingHotkeyRelease(reason: "hotkey monitoring failure")
         resetHotkeySessionTracking()
         stopSpeechMonitoringAndResetVisuals()
         hotkeyMonitor.stop()
@@ -362,7 +344,7 @@ final class AppCoordinator {
         }
 
         switch trigger {
-        case .engineConfigurationChanged:
+        case .captureRuntimeIssue:
             beginSpeechRecovery(trigger, restartDelayNanoseconds: interactionRecoveryDelayNanoseconds)
         case .pointerDown, .activeApplicationChanged:
             guard stateMachine.state == .speaking || lastMeasuredSpeechLevel > speechRecoverySignalThreshold else {
@@ -385,9 +367,6 @@ final class AppCoordinator {
         }
 
         lastMeasuredSpeechLevel = normalizedLevel
-        if normalizedLevel > speechRecoverySignalThreshold {
-            lastAudibleSpeechUptime = ProcessInfo.processInfo.systemUptime
-        }
         panelController.apply(speechLevel: CGFloat(normalizedLevel))
 
         if isAwaitingInteractionSignal, normalizedLevel > speechRecoverySignalThreshold {
@@ -443,27 +422,34 @@ final class AppCoordinator {
 
         switch result {
         case .started:
+            statusItemController.updateSpeechSourceWarning(nil)
             return result
         case .permissionPending:
+            statusItemController.updateSpeechSourceWarning(nil)
             print(microphonePermissionRequestMessage)
         case .denied:
+            statusItemController.updateSpeechSourceWarning(nil)
             handleSpeechMonitoringFailure(
                 microphoneAccessMessage,
                 openSystemSettings: true
             )
         case .unavailable:
+            statusItemController.updateSpeechSourceWarning(nil)
             handleSpeechMonitoringFailure(
                 microphoneUnavailableMessage,
                 openSystemSettings: false
             )
+        case let .unresolvedSource(message):
+            statusItemController.updateSpeechSourceWarning(message)
+            debugLog("speech source unresolved message=\(message)")
         }
 
         return result
     }
 
     private func handleSpeechMonitoringFailure(_ message: String, openSystemSettings: Bool) {
-        cancelPendingHotkeyRelease(reason: "speech monitoring failure")
         cancelSpeechRecovery(reason: "speech monitoring failure", resetAttemptState: true)
+        statusItemController.updateSpeechSourceWarning(nil)
         setCoordinatorErrorState(.speechMonitoring)
         resetHotkeySessionTracking()
         stopSpeechMonitoringAndResetVisuals()
@@ -478,7 +464,6 @@ final class AppCoordinator {
 
     private func restartHotkeyMonitoringAfterInputMonitoringGrant() {
         debugLog("Input Monitoring access granted; restarting hotkey monitoring")
-        cancelPendingHotkeyRelease(reason: "restarting hotkey monitoring")
         hotkeyMonitor.stop()
         isAwaitingRecoveredHotkeyObservation = true
         _ = startMonitoring(requestAccessIfNeeded: false)
@@ -503,87 +488,12 @@ final class AppCoordinator {
         speechRecoveryRestartTask != nil || speechRecoverySignalVerificationTask != nil || isAwaitingSpeechRecoverySignal
     }
 
-    private func armHotkeyReleaseConfirmation() {
-        if hotkeyReleaseGracePeriodNanoseconds == 0 {
-            finalizeHotkeyRelease()
-            return
-        }
-
-        cancelPendingHotkeyRelease(reason: "rescheduled hotkey release confirmation")
-        debugLog("received hotkey released; delaying stop graceMs=\(hotkeyReleaseGracePeriodNanoseconds / 1_000_000)")
-
-        pendingHotkeyReleaseTask = Task { @MainActor [weak self] in
-            do {
-                try await Task.sleep(nanoseconds: self?.hotkeyReleaseGracePeriodNanoseconds ?? 0)
-            } catch {
-                return
-            }
-
-            guard let self else {
-                return
-            }
-
-            self.handlePendingHotkeyReleaseConfirmation()
-        }
-    }
-
-    private func handlePendingHotkeyReleaseConfirmation() {
-        pendingHotkeyReleaseTask = nil
-        guard isEnabled, isHotkeyHeld else {
-            return
-        }
-
-        if shouldExtendHotkeyReleaseGrace {
-            debugLog(
-                "extending hotkey release grace while speech or recovery is still active recentSpeechMs=\(recentSpeechMilliseconds)"
-            )
-            armHotkeyReleaseConfirmation()
-            return
-        }
-
-        finalizeHotkeyRelease()
-    }
-
-    private var shouldExtendHotkeyReleaseGrace: Bool {
-        stateMachine.state == .speaking || hasRecentAudibleSpeech || isAwaitingInteractionSignal || hasActiveSpeechRecovery
-    }
-
-    private var hasRecentAudibleSpeech: Bool {
-        guard lastAudibleSpeechUptime > 0 else {
-            return false
-        }
-
-        let elapsedSeconds = ProcessInfo.processInfo.systemUptime - lastAudibleSpeechUptime
-        return elapsedSeconds < hotkeyReleaseSpeechContinuationWindowSeconds
-    }
-
-    private var hotkeyReleaseSpeechContinuationWindowSeconds: TimeInterval {
-        TimeInterval(hotkeyReleaseSpeechContinuationWindowNanoseconds) / 1_000_000_000
-    }
-
-    private var recentSpeechMilliseconds: Int {
-        guard lastAudibleSpeechUptime > 0 else {
-            return -1
-        }
-
-        return Int((ProcessInfo.processInfo.systemUptime - lastAudibleSpeechUptime) * 1_000)
-    }
-
     private func finalizeHotkeyRelease() {
-        cancelPendingHotkeyRelease(reason: "hotkey release confirmed")
-        cancelSpeechRecovery(reason: "hotkey release confirmed", resetAttemptState: true)
-        debugLog("confirmed hotkey released")
+        cancelSpeechRecovery(reason: "hotkey released", resetAttemptState: true)
+        debugLog("confirmed hotkey released; stopping capture immediately")
         resetHotkeySessionTracking()
         stateMachine.handle(.hotkeyReleased)
         stopSpeechMonitoringAndResetVisuals()
-    }
-
-    private func cancelPendingHotkeyRelease(reason: String) {
-        if let pendingHotkeyReleaseTask {
-            pendingHotkeyReleaseTask.cancel()
-            self.pendingHotkeyReleaseTask = nil
-            debugLog("cancelled pending hotkey release reason=\(reason)")
-        }
     }
 
     private func resetHotkeySessionTracking() {
@@ -593,7 +503,6 @@ final class AppCoordinator {
 
     private func resetSpeechTracking() {
         lastMeasuredSpeechLevel = 0
-        lastAudibleSpeechUptime = 0
     }
 
     private func resetSpeechLevelDisplay() {

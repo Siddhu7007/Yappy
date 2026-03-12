@@ -1,10 +1,25 @@
 // Manages the floating overlay panel, including launch placement, drag persistence, and recentering.
 import AppKit
 
+enum OverlaySizeMode: Equatable {
+    case idle
+    case activeCover
+
+    var displayScale: CGFloat {
+        switch self {
+        case .idle:
+            1
+        case .activeCover:
+            SplitHeadCharacterRig.activeCoverScale
+        }
+    }
+}
+
 @MainActor
 protocol OverlayPanelControlling: AnyObject {
     func show()
     func apply(state: CharacterState)
+    func apply(sizeMode: OverlaySizeMode, animated: Bool)
     func apply(speechLevel: CGFloat)
     func recenter()
 }
@@ -12,14 +27,17 @@ protocol OverlayPanelControlling: AnyObject {
 @MainActor
 final class OverlayPanelController: OverlayPanelControlling {
     private let positionStore: OverlayPositionStore
-    private let contentView = OverlayContentView(frame: CGRect(origin: .zero, size: SplitHeadCharacterRig.canvasSize))
+    private let contentView = OverlayContentView(
+        frame: CGRect(origin: .zero, size: SplitHeadCharacterRig.activeCoverCanvasSize)
+    )
     private let panel: OverlayPanel
     private let anchoredBottomInset: CGFloat = 4
+    private var currentSizeMode: OverlaySizeMode = .idle
 
     init(positionStore: OverlayPositionStore) {
         self.positionStore = positionStore
         self.panel = OverlayPanel(
-            contentRect: CGRect(origin: .zero, size: SplitHeadCharacterRig.canvasSize),
+            contentRect: CGRect(origin: .zero, size: SplitHeadCharacterRig.activeCoverCanvasSize),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -36,6 +54,16 @@ final class OverlayPanelController: OverlayPanelControlling {
     func apply(state: CharacterState) {
         panel.orderFrontRegardless()
         contentView.apply(state: state)
+    }
+
+    func apply(sizeMode: OverlaySizeMode, animated: Bool) {
+        guard currentSizeMode != sizeMode else {
+            return
+        }
+
+        currentSizeMode = sizeMode
+        panel.orderFrontRegardless()
+        contentView.apply(sizeMode: sizeMode, animated: animated)
     }
 
     func apply(speechLevel: CGFloat) {
@@ -62,13 +90,12 @@ final class OverlayPanelController: OverlayPanelControlling {
     }
 
     private func resolvedFrame() -> CGRect {
-        let origin = anchoredOrigin(in: primaryVisibleFrame())
-        return CGRect(origin: origin, size: SplitHeadCharacterRig.canvasSize)
+        CGRect(origin: anchoredOrigin(in: primaryVisibleFrame()), size: SplitHeadCharacterRig.activeCoverCanvasSize)
     }
 
     private func anchoredOrigin(in visibleFrame: CGRect) -> CGPoint {
         CGPoint(
-            x: visibleFrame.midX - (SplitHeadCharacterRig.canvasSize.width / 2),
+            x: visibleFrame.midX - (SplitHeadCharacterRig.activeCoverCanvasSize.width / 2),
             y: visibleFrame.minY + anchoredBottomInset
         )
     }
@@ -76,6 +103,6 @@ final class OverlayPanelController: OverlayPanelControlling {
     private func primaryVisibleFrame() -> CGRect {
         NSScreen.main?.visibleFrame
             ?? NSScreen.screens.first?.visibleFrame
-            ?? CGRect(origin: .zero, size: SplitHeadCharacterRig.canvasSize)
+            ?? CGRect(origin: .zero, size: SplitHeadCharacterRig.activeCoverCanvasSize)
     }
 }

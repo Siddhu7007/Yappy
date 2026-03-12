@@ -15,6 +15,10 @@ final class AppCoordinator {
         static let maxAttempts = 3
     }
 
+    private enum OverlayCoverDefaults {
+        static let releaseGraceNanoseconds: UInt64 = 1_500_000_000
+    }
+
     private let panelController: OverlayPanelControlling
     private let permissionAccess: InputMonitoringAccessing
     private let speechMonitor: SpeechActivityMonitoring
@@ -26,6 +30,7 @@ final class AppCoordinator {
     private let speechRecoverySignalVerificationDelayNanoseconds: UInt64
     private let speechRecoverySignalThreshold: Float
     private let maxSpeechRecoveryAttempts: Int
+    private let overlayCoverReleaseGraceNanoseconds: UInt64
 
     private var isEnabled = true
     private var isHotkeyHeld = false
@@ -39,6 +44,7 @@ final class AppCoordinator {
     private var isAwaitingInteractionSignal = false
     private var isAwaitingSpeechRecoverySignal = false
     private var lastMeasuredSpeechLevel: Float = 0
+    private var overlayCoverResetTask: Task<Void, Never>?
 
     init(
         positionStore: OverlayPositionStore? = nil,
@@ -52,7 +58,8 @@ final class AppCoordinator {
         interactionRecoveryDelayNanoseconds: UInt64 = 150_000_000,
         speechRecoverySignalVerificationDelayNanoseconds: UInt64 = SpeechRecoveryDefaults.signalVerificationDelayNanoseconds,
         speechRecoverySignalThreshold: Float = SpeechRecoveryDefaults.signalThreshold,
-        maxSpeechRecoveryAttempts: Int = SpeechRecoveryDefaults.maxAttempts
+        maxSpeechRecoveryAttempts: Int = SpeechRecoveryDefaults.maxAttempts,
+        overlayCoverReleaseGraceNanoseconds: UInt64 = OverlayCoverDefaults.releaseGraceNanoseconds
     ) {
         let resolvedPositionStore = positionStore ?? OverlayPositionStore()
         let resolvedPermissionAccess = permissionAccess ?? InputMonitoringAccess()
@@ -74,6 +81,7 @@ final class AppCoordinator {
         self.speechRecoverySignalVerificationDelayNanoseconds = speechRecoverySignalVerificationDelayNanoseconds
         self.speechRecoverySignalThreshold = speechRecoverySignalThreshold
         self.maxSpeechRecoveryAttempts = maxSpeechRecoveryAttempts
+        self.overlayCoverReleaseGraceNanoseconds = overlayCoverReleaseGraceNanoseconds
 
         resolvedStateMachine.onStateChange = { [weak self] state in
             self?.panelController.apply(state: state)
@@ -132,6 +140,7 @@ final class AppCoordinator {
         debugLog("bundle id=\(Bundle.main.bundleIdentifier ?? "unknown") app path=\(Bundle.main.bundleURL.path)")
 
         panelController.show()
+        panelController.apply(sizeMode: .idle, animated: false)
         panelController.apply(state: stateMachine.state)
         statusItemController.updateEnabled(isEnabled)
         statusItemController.updateSpeechSourceWarning(nil)
@@ -143,6 +152,7 @@ final class AppCoordinator {
     func stop() {
         stopPermissionPolling()
         cancelSpeechRecovery(reason: "app stop", resetAttemptState: true)
+        cancelOverlayCoverReset(reason: "app stop", resetToIdle: true)
         resetHotkeySessionTracking()
         clearCoordinatorErrorState()
         speechMonitor.stop()
@@ -160,8 +170,10 @@ final class AppCoordinator {
             }
 
             cancelSpeechRecovery(reason: "fresh hotkey press", resetAttemptState: true)
+            cancelOverlayCoverReset(reason: "fresh hotkey press", resetToIdle: false)
             debugLog("received hotkey pressed")
             isHotkeyHeld = true
+            panelController.apply(sizeMode: .activeCover, animated: true)
             resetSpeechTracking()
             resetSpeechLevelDisplay()
             stateMachine.handle(.hotkeyPressed)
@@ -207,6 +219,7 @@ final class AppCoordinator {
     private func disableCoordinator() {
         interactionMonitor.stop()
         cancelSpeechRecovery(reason: "disabled", resetAttemptState: true)
+        cancelOverlayCoverReset(reason: "disabled", resetToIdle: true)
         stopPermissionPolling()
         resetHotkeySessionTracking()
         clearCoordinatorErrorState()
@@ -494,6 +507,7 @@ final class AppCoordinator {
         resetHotkeySessionTracking()
         stateMachine.handle(.hotkeyReleased)
         stopSpeechMonitoringAndResetVisuals()
+        scheduleOverlayCoverResetAfterRelease()
     }
 
     private func resetHotkeySessionTracking() {
@@ -512,6 +526,41 @@ final class AppCoordinator {
     private func stopSpeechMonitoringAndResetVisuals() {
         speechMonitor.stop()
         resetSpeechLevelDisplay()
+    }
+
+    private func scheduleOverlayCoverResetAfterRelease() {
+        cancelOverlayCoverReset(reason: "schedule overlay reset", resetToIdle: false)
+        let delay = overlayCoverReleaseGraceNanoseconds
+        debugLog("overlay cover reset armed timeoutMs=\(delay / 1_000_000)")
+        overlayCoverResetTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: delay)
+            } catch {
+                return
+            }
+
+            guard let self, !Task.isCancelled else {
+                return
+            }
+
+            self.overlayCoverResetTask = nil
+            self.debugLog("overlay cover reset fired")
+            self.panelController.apply(sizeMode: .idle, animated: true)
+        }
+    }
+
+    private func cancelOverlayCoverReset(reason: String, resetToIdle: Bool) {
+        if let overlayCoverResetTask {
+            overlayCoverResetTask.cancel()
+            self.overlayCoverResetTask = nil
+            debugLog("overlay cover reset cancelled reason=\(reason)")
+        }
+
+        guard resetToIdle else {
+            return
+        }
+
+        panelController.apply(sizeMode: .idle, animated: false)
     }
 
     private func setCoordinatorErrorState(_ cause: CoordinatorErrorCause) {

@@ -7,6 +7,7 @@ struct SpeechMotionProfileTests {
     func zeroLevelUsesListeningOffset() {
         let profile = SpeechMotionProfile()
 
+        #expect(SplitHeadCharacterRig.upperHeadListeningOffset == 5)
         #expect(profile.offset(for: 0) == SplitHeadCharacterRig.upperHeadListeningOffset)
     }
 
@@ -16,6 +17,7 @@ struct SpeechMotionProfileTests {
         let offset = profile.offset(for: 0.01)
 
         #expect(offset > SplitHeadCharacterRig.upperHeadListeningOffset)
+        #expect(offset < SplitHeadCharacterRig.upperHeadListeningOffset + 2.0)
     }
 
     @Test

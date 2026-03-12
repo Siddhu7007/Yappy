@@ -279,6 +279,7 @@ struct AppCoordinatorTests {
         hotkeyMonitor.emit(.pressed)
 
         #expect(speechMonitor.startCallCount == 1)
+        #expect(panelController.appliedSizeModes.last == .activeCover)
         #expect(panelController.appliedStates.last == .listening)
 
         speechMonitor.emitSpeechActivity(true)
@@ -292,6 +293,74 @@ struct AppCoordinatorTests {
         #expect(speechMonitor.stopCallCount == 1)
         #expect(panelController.appliedStates.last == .idle)
         #expect(panelController.speechLevels.last == 0)
+    }
+
+    @Test
+    func hotkeyReleaseKeepsOverlayLargeUntilGracePeriodExpires() async {
+        let panelController = OverlayPanelControllerSpy()
+        let speechMonitor = SpeechMonitorSpy()
+        let hotkeyMonitor = HotkeyMonitorSpy()
+        let coordinator = makeCoordinator(
+            speechMonitor: speechMonitor,
+            panelController: panelController,
+            hotkeyMonitor: hotkeyMonitor,
+            overlayCoverReleaseGraceNanoseconds: 20_000_000
+        )
+
+        coordinator.start()
+        hotkeyMonitor.emit(.pressed)
+        hotkeyMonitor.emit(.released)
+
+        #expect(panelController.appliedSizeModes.last == .activeCover)
+        try? await Task.sleep(nanoseconds: 80_000_000)
+
+        #expect(panelController.appliedSizeModes.last == .idle)
+    }
+
+    @Test
+    func pressingFnAgainBeforeGraceExpiresCancelsTheShrinkBackToIdle() async {
+        let panelController = OverlayPanelControllerSpy()
+        let speechMonitor = SpeechMonitorSpy()
+        let hotkeyMonitor = HotkeyMonitorSpy()
+        let coordinator = makeCoordinator(
+            speechMonitor: speechMonitor,
+            panelController: panelController,
+            hotkeyMonitor: hotkeyMonitor,
+            overlayCoverReleaseGraceNanoseconds: 80_000_000
+        )
+
+        coordinator.start()
+        hotkeyMonitor.emit(.pressed)
+        hotkeyMonitor.emit(.released)
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        hotkeyMonitor.emit(.pressed)
+        try? await Task.sleep(nanoseconds: 120_000_000)
+
+        #expect(panelController.appliedSizeModes.last == .activeCover)
+    }
+
+    @Test
+    func disablingWhileReleaseGraceIsActiveResetsOverlayToIdleImmediately() async {
+        let panelController = OverlayPanelControllerSpy()
+        let speechMonitor = SpeechMonitorSpy()
+        let hotkeyMonitor = HotkeyMonitorSpy()
+        let statusItemController = StatusItemControllerSpy()
+        let coordinator = makeCoordinator(
+            speechMonitor: speechMonitor,
+            panelController: panelController,
+            hotkeyMonitor: hotkeyMonitor,
+            statusItemController: statusItemController,
+            overlayCoverReleaseGraceNanoseconds: 80_000_000
+        )
+
+        coordinator.start()
+        hotkeyMonitor.emit(.pressed)
+        hotkeyMonitor.emit(.released)
+
+        statusItemController.onToggleEnabled?(false)
+        try? await Task.sleep(nanoseconds: 20_000_000)
+
+        #expect(panelController.appliedSizeModes.last == .idle)
     }
 
     @Test
@@ -603,7 +672,8 @@ struct AppCoordinatorTests {
         interactionRecoveryDelayNanoseconds: UInt64 = 150_000_000,
         speechRecoverySignalVerificationDelayNanoseconds: UInt64 = 1_250_000_000,
         speechRecoverySignalThreshold: Float = 0.005,
-        maxSpeechRecoveryAttempts: Int = 3
+        maxSpeechRecoveryAttempts: Int = 3,
+        overlayCoverReleaseGraceNanoseconds: UInt64 = 1_500_000_000
     ) -> AppCoordinator {
         AppCoordinator(
             permissionAccess: inputMonitoringAccess ?? InputMonitoringAccessSpy(),
@@ -615,7 +685,8 @@ struct AppCoordinatorTests {
             interactionRecoveryDelayNanoseconds: interactionRecoveryDelayNanoseconds,
             speechRecoverySignalVerificationDelayNanoseconds: speechRecoverySignalVerificationDelayNanoseconds,
             speechRecoverySignalThreshold: speechRecoverySignalThreshold,
-            maxSpeechRecoveryAttempts: maxSpeechRecoveryAttempts
+            maxSpeechRecoveryAttempts: maxSpeechRecoveryAttempts,
+            overlayCoverReleaseGraceNanoseconds: overlayCoverReleaseGraceNanoseconds
         )
     }
 }
@@ -712,6 +783,7 @@ private final class InteractionMonitorSpy: InteractionMonitoring {
 private final class OverlayPanelControllerSpy: OverlayPanelControlling {
     private(set) var showCallCount = 0
     private(set) var appliedStates = [CharacterState]()
+    private(set) var appliedSizeModes = [OverlaySizeMode]()
     private(set) var speechLevels = [CGFloat]()
     private(set) var recenterCallCount = 0
 
@@ -721,6 +793,10 @@ private final class OverlayPanelControllerSpy: OverlayPanelControlling {
 
     func apply(state: CharacterState) {
         appliedStates.append(state)
+    }
+
+    func apply(sizeMode: OverlaySizeMode, animated: Bool) {
+        appliedSizeModes.append(sizeMode)
     }
 
     func apply(speechLevel: CGFloat) {

@@ -12,8 +12,8 @@ struct SpeechLevelMeter {
     init(
         floorDB: Float = -52,
         ceilingDB: Float = -18,
-        attackSmoothing: Float = 0.38,
-        releaseSmoothing: Float = 0.16
+        attackSmoothing: Float = 0.56,
+        releaseSmoothing: Float = 0.32
     ) {
         self.floorDB = floorDB
         self.ceilingDB = ceilingDB

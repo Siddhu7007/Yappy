@@ -9,10 +9,10 @@ struct SpeechMotionProfile {
     let exponent: CGFloat
 
     init(
-        listeningOffset: CGFloat = 10,
-        maxSpeakingOffset: CGFloat = 28,
-        minimumVisibleLevel: CGFloat = 0.22,
-        exponent: CGFloat = 0.78
+        listeningOffset: CGFloat = SplitHeadCharacterRig.upperHeadListeningOffset,
+        maxSpeakingOffset: CGFloat = SplitHeadCharacterRig.upperHeadOpenOffset,
+        minimumVisibleLevel: CGFloat = 0.07,
+        exponent: CGFloat = 1.08
     ) {
         self.listeningOffset = listeningOffset
         self.maxSpeakingOffset = maxSpeakingOffset

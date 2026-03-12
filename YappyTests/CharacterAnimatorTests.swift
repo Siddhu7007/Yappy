@@ -32,111 +32,83 @@ struct CharacterAnimatorTests {
     }
 
     @Test
-    func speakingPulseKeepsTheSameTiltUntilTheHeadCloses() {
-        let (rig, animator) = makeAnimator(
-            speechPoses: [
-                .tiltLeft(tiltDegrees: 9, horizontalOffset: 3),
-                .tiltRight(tiltDegrees: 11, horizontalOffset: 4)
-            ]
-        )
+    func speakingStartsOnACenteredOpenBeat() {
+        let (rig, animator) = makeAnimator()
         animator.apply(state: .speaking)
 
         animator.updateSpeechLevel(0.85)
-        let firstTilt = rig.upperHeadTiltDegrees
-        let firstHorizontalOffset = rig.upperHeadHorizontalOffset
-        let fullSpeakingOffset = rig.speakingOffset(for: 0.85)
-        let leftClosedPositionY = closedPositionY(
-            in: rig.upperHeadLayer.bounds,
-            anchorPoint: SplitHeadCharacterRig.upperHeadLeftHingeAnchorPoint
-        )
 
-        animator.updateSpeechLevel(0.32)
-
-        #expect(rig.upperHeadLayer.position.y > rig.upperHeadListeningPositionY)
-        #expect(firstTilt > 0)
-        #expect(firstHorizontalOffset < 0)
-        #expect(rig.upperHeadHingeAlignment == .left)
-        #expect(abs(rig.upperHeadLayer.anchorPoint.x - SplitHeadCharacterRig.upperHeadLeftHingeAnchorPoint.x) < tolerance)
-        #expect(rig.upperHeadLayer.position.y < leftClosedPositionY + fullSpeakingOffset)
-        #expect(abs(rig.upperHeadTiltDegrees - firstTilt) < tolerance)
-        #expect(abs(rig.upperHeadHorizontalOffset - firstHorizontalOffset) < tolerance)
+        assertPose(rig, matches: .center)
     }
 
     @Test
-    func closingAndReopeningSamplesANewTiltPose() {
-        let (rig, animator) = makeAnimator(
-            speechPoses: [
-                .tiltLeft(tiltDegrees: 9, horizontalOffset: 3),
-                .tiltRight(tiltDegrees: 11, horizontalOffset: 4)
-            ]
-        )
+    func speakingCadenceAlternatesLeftCenterAndRight() {
+        let (rig, animator) = makeAnimator()
         animator.apply(state: .speaking)
-
         animator.updateSpeechLevel(0.9)
-        let firstTilt = rig.upperHeadTiltDegrees
+        assertPose(rig, matches: .center)
+
+        animator.advanceSpeechBeat()
+        assertPose(rig, matches: .tiltLeft)
+
+        animator.advanceSpeechBeat()
+        assertPose(rig, matches: .center)
+
+        animator.advanceSpeechBeat()
+        assertPose(rig, matches: .tiltRight)
+
+        animator.advanceSpeechBeat()
+        assertPose(rig, matches: .center)
+    }
+
+    @Test
+    func speechLevelUpdatesDoNotChangeTheHeldBeatPose() {
+        let (rig, animator) = makeAnimator()
+        animator.apply(state: .speaking)
+        animator.updateSpeechLevel(0.88)
+        animator.advanceSpeechBeat()
+
+        let initialTilt = rig.upperHeadTiltDegrees
+        let initialHorizontalOffset = rig.upperHeadHorizontalOffset
+        let initialOffset = rig.upperHeadOffset
+        let initialAnchorPoint = rig.upperHeadLayer.anchorPoint
+
+        animator.updateSpeechLevel(0.23)
+        animator.updateSpeechLevel(0.92)
+
+        #expect(abs(rig.upperHeadTiltDegrees - initialTilt) < tolerance)
+        #expect(abs(rig.upperHeadHorizontalOffset - initialHorizontalOffset) < tolerance)
+        #expect(abs(rig.upperHeadOffset - initialOffset) < tolerance)
+        #expect(abs(rig.upperHeadLayer.anchorPoint.x - initialAnchorPoint.x) < tolerance)
+        #expect(abs(rig.upperHeadLayer.anchorPoint.y - initialAnchorPoint.y) < tolerance)
+        #expect(rig.upperHeadHingeAlignment == .left)
+    }
+
+    @Test
+    func droppingBelowSpeechThresholdStopsCadenceAndRestartsFromCenter() {
+        let (rig, animator) = makeAnimator()
+        animator.apply(state: .speaking)
+        animator.updateSpeechLevel(0.9)
+        animator.advanceSpeechBeat()
+        assertPose(rig, matches: .tiltLeft)
 
         animator.updateSpeechLevel(0.01)
 
-        #expect(firstTilt > 0)
+        #expect(rig.upperHeadLayer.position.y == rig.upperHeadListeningPositionY)
         #expect(abs(rig.upperHeadTiltDegrees) < tolerance)
         #expect(abs(rig.upperHeadHorizontalOffset) < tolerance)
         #expect(rig.upperHeadHingeAlignment == .centered)
 
         animator.updateSpeechLevel(0.92)
-
-        #expect(rig.upperHeadTiltDegrees < 0)
-        #expect(abs(rig.upperHeadTiltDegrees + 11) < tolerance)
-        #expect(abs(rig.upperHeadHorizontalOffset - 4) < tolerance)
-        #expect(rig.upperHeadHingeAlignment == .right)
-        #expect(abs(rig.upperHeadLayer.anchorPoint.x - SplitHeadCharacterRig.upperHeadRightHingeAnchorPoint.x) < tolerance)
-    }
-
-    @Test
-    func sustainedSpeechCanRepickPoseOnANewRiseWithoutFullyClosing() {
-        let (rig, animator) = makeAnimator(
-            speechPoses: [
-                .tiltLeft(tiltDegrees: 9, horizontalOffset: 3),
-                .tiltRight(tiltDegrees: 10, horizontalOffset: 4)
-            ]
-        )
-        animator.apply(state: .speaking)
-
-        animator.updateSpeechLevel(0.88)
-        let initialTilt = rig.upperHeadTiltDegrees
-
-        animator.updateSpeechLevel(0.23)
-        animator.updateSpeechLevel(0.38)
-
-        #expect(initialTilt > 0)
-        #expect(rig.upperHeadTiltDegrees < 0)
-        #expect(abs(rig.upperHeadTiltDegrees + 10) < tolerance)
-        #expect(abs(rig.upperHeadHorizontalOffset - 4) < tolerance)
-        #expect(rig.upperHeadHingeAlignment == .right)
-    }
-
-    @Test
-    func sideHingedSpeechKeepsTheSeamSideCloserToClosedThanACenteredOpen() {
-        let (rig, animator) = makeAnimator(speechPoses: [.tiltRight(tiltDegrees: 12, horizontalOffset: 2)])
-        animator.apply(state: .speaking)
-
-        animator.updateSpeechLevel(0.9)
-
-        let rightClosedPositionY = closedPositionY(
-            in: rig.upperHeadLayer.bounds,
-            anchorPoint: SplitHeadCharacterRig.upperHeadRightHingeAnchorPoint
-        )
-        let fullSpeakingOffset = rig.speakingOffset(for: 0.9)
-
-        #expect(rig.upperHeadHingeAlignment == .right)
-        #expect(rig.upperHeadLayer.position.y > rightClosedPositionY + SplitHeadCharacterRig.upperHeadListeningOffset)
-        #expect(rig.upperHeadLayer.position.y < rightClosedPositionY + fullSpeakingOffset)
+        assertPose(rig, matches: .center)
     }
 
     @Test
     func returningToListeningRestoresTheFixedListeningOffset() {
-        let (rig, animator) = makeAnimator(speechPoses: [.tiltLeft(tiltDegrees: 10, horizontalOffset: 4)])
+        let (rig, animator) = makeAnimator()
         animator.apply(state: .speaking)
         animator.updateSpeechLevel(0.92)
+        animator.advanceSpeechBeat()
 
         animator.apply(state: .listening)
 
@@ -144,6 +116,13 @@ struct CharacterAnimatorTests {
         #expect(abs(rig.upperHeadTiltDegrees) < tolerance)
         #expect(abs(rig.upperHeadHorizontalOffset) < tolerance)
         #expect(rig.upperHeadHingeAlignment == .centered)
+
+        let listeningPositionY = rig.upperHeadLayer.position.y
+        animator.advanceSpeechBeat()
+
+        #expect(rig.upperHeadLayer.position.y == listeningPositionY)
+        #expect(abs(rig.upperHeadTiltDegrees) < tolerance)
+        #expect(abs(rig.upperHeadHorizontalOffset) < tolerance)
     }
 
     @Test
@@ -156,6 +135,14 @@ struct CharacterAnimatorTests {
         #expect(abs(rig.displayScale - SplitHeadCharacterRig.activeCoverScale) < tolerance)
         #expect(abs(rig.rootLayer.transform.m11 - SplitHeadCharacterRig.activeCoverScale) < tolerance)
         #expect(abs(rig.rootLayer.transform.m22 - SplitHeadCharacterRig.activeCoverScale) < tolerance)
+    }
+
+    @Test
+    func activeCoverCanvasHasHeadroomForTheLiftedSpeakingPose() {
+        let requiredHeight = (SplitHeadCharacterRig.canvasSize.height + SplitHeadCharacterRig.speakingCadenceCenterOffset)
+            * SplitHeadCharacterRig.activeCoverScale
+
+        #expect(SplitHeadCharacterRig.activeCoverCanvasSize.height > requiredHeight)
     }
 
     @Test
@@ -172,21 +159,72 @@ struct CharacterAnimatorTests {
         #expect(abs(rig.rootLayer.position.y - frame.minY) < tolerance)
     }
 
-    private func makeAnimator(speechPoses: [CharacterAnimator.SpeechPose] = [.center]) -> (SplitHeadCharacterRig, CharacterAnimator) {
+    @Test
+    func blinkLayersStayInsideTheUpperHeadBounds() {
         let rig = SplitHeadCharacterRig()
         rig.layout(in: CGRect(origin: .zero, size: SplitHeadCharacterRig.canvasSize))
-        var remainingPoses = speechPoses
-        let animator = CharacterAnimator(rig: rig) {
-            guard !remainingPoses.isEmpty else {
-                return .center
-            }
 
-            return remainingPoses.removeFirst()
-        }
+        #expect(rig.upperHeadLayer.bounds.contains(rig.leftEyeBlinkCoverLayer.frame))
+        #expect(rig.upperHeadLayer.bounds.contains(rig.rightEyeBlinkCoverLayer.frame))
+        #expect(rig.upperHeadLayer.bounds.contains(rig.leftEyeClosedLineLayer.frame))
+        #expect(rig.upperHeadLayer.bounds.contains(rig.rightEyeClosedLineLayer.frame))
+    }
+
+    @Test
+    func blinkAddsEyeAnimationsWithoutChangingTheHeadPose() {
+        let rig = SplitHeadCharacterRig()
+        rig.layout(in: CGRect(origin: .zero, size: SplitHeadCharacterRig.canvasSize))
+        rig.setUpperHeadPose(
+            offset: SplitHeadCharacterRig.speakingCadenceSideOffset,
+            tiltDegrees: SplitHeadCharacterRig.speakingCadenceTiltDegrees,
+            horizontalOffset: -SplitHeadCharacterRig.speakingCadenceHorizontalOffset,
+            hingeAlignment: .left,
+            animated: false,
+            duration: 0
+        )
+
+        let initialOffset = rig.upperHeadOffset
+        let initialTilt = rig.upperHeadTiltDegrees
+        let initialHorizontalOffset = rig.upperHeadHorizontalOffset
+
+        rig.blink()
+
+        #expect(rig.leftEyeBlinkCoverLayer.animation(forKey: "blink.scale") != nil)
+        #expect(rig.rightEyeBlinkCoverLayer.animation(forKey: "blink.scale") != nil)
+        #expect(rig.leftEyeClosedLineLayer.animation(forKey: "blink.lineOpacity") != nil)
+        #expect(rig.rightEyeClosedLineLayer.animation(forKey: "blink.lineOpacity") != nil)
+        #expect(abs(rig.upperHeadOffset - initialOffset) < tolerance)
+        #expect(abs(rig.upperHeadTiltDegrees - initialTilt) < tolerance)
+        #expect(abs(rig.upperHeadHorizontalOffset - initialHorizontalOffset) < tolerance)
+    }
+
+    private func makeAnimator() -> (SplitHeadCharacterRig, CharacterAnimator) {
+        let rig = SplitHeadCharacterRig()
+        rig.layout(in: CGRect(origin: .zero, size: SplitHeadCharacterRig.canvasSize))
+        let animator = CharacterAnimator(rig: rig, automaticallyAdvanceSpeechCadence: false)
         return (rig, animator)
     }
 
-    private func closedPositionY(in bounds: CGRect, anchorPoint: CGPoint) -> CGFloat {
-        bounds.minY + (bounds.height * anchorPoint.y)
+    private func assertPose(_ rig: SplitHeadCharacterRig, matches expectedPose: CharacterAnimator.SpeechPose) {
+        switch expectedPose {
+        case .center:
+            #expect(abs(rig.upperHeadOffset - SplitHeadCharacterRig.speakingCadenceCenterOffset) < tolerance)
+            #expect(abs(rig.upperHeadTiltDegrees) < tolerance)
+            #expect(abs(rig.upperHeadHorizontalOffset) < tolerance)
+            #expect(rig.upperHeadHingeAlignment == .centered)
+            #expect(abs(rig.upperHeadLayer.anchorPoint.x - SplitHeadCharacterRig.upperHeadCenterAnchorPoint.x) < tolerance)
+        case .tiltLeft:
+            #expect(abs(rig.upperHeadOffset - SplitHeadCharacterRig.speakingCadenceSideOffset) < tolerance)
+            #expect(abs(rig.upperHeadTiltDegrees - SplitHeadCharacterRig.speakingCadenceTiltDegrees) < tolerance)
+            #expect(abs(rig.upperHeadHorizontalOffset + SplitHeadCharacterRig.speakingCadenceHorizontalOffset) < tolerance)
+            #expect(rig.upperHeadHingeAlignment == .left)
+            #expect(abs(rig.upperHeadLayer.anchorPoint.x - SplitHeadCharacterRig.upperHeadLeftHingeAnchorPoint.x) < tolerance)
+        case .tiltRight:
+            #expect(abs(rig.upperHeadOffset - SplitHeadCharacterRig.speakingCadenceSideOffset) < tolerance)
+            #expect(abs(rig.upperHeadTiltDegrees + SplitHeadCharacterRig.speakingCadenceTiltDegrees) < tolerance)
+            #expect(abs(rig.upperHeadHorizontalOffset - SplitHeadCharacterRig.speakingCadenceHorizontalOffset) < tolerance)
+            #expect(rig.upperHeadHingeAlignment == .right)
+            #expect(abs(rig.upperHeadLayer.anchorPoint.x - SplitHeadCharacterRig.upperHeadRightHingeAnchorPoint.x) < tolerance)
+        }
     }
 }

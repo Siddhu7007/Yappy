@@ -1,23 +1,22 @@
 // Applies state-driven animation to the split-head layer rig.
+import Foundation
 import QuartzCore
 
 @MainActor
 final class CharacterAnimator {
     enum SpeechPose: Equatable {
         case center
-        case tiltLeft(tiltDegrees: CGFloat, horizontalOffset: CGFloat)
-        case tiltRight(tiltDegrees: CGFloat, horizontalOffset: CGFloat)
-
-        private static let sideOpenLiftScale: CGFloat = 0.28
+        case tiltLeft
+        case tiltRight
 
         var tiltDegrees: CGFloat {
             switch self {
             case .center:
                 0
-            case let .tiltLeft(degrees, _):
-                abs(degrees)
-            case let .tiltRight(degrees, _):
-                -abs(degrees)
+            case .tiltLeft:
+                SplitHeadCharacterRig.speakingCadenceTiltDegrees
+            case .tiltRight:
+                -SplitHeadCharacterRig.speakingCadenceTiltDegrees
             }
         }
 
@@ -25,10 +24,10 @@ final class CharacterAnimator {
             switch self {
             case .center:
                 0
-            case let .tiltLeft(_, horizontalOffset):
-                -abs(horizontalOffset)
-            case let .tiltRight(_, horizontalOffset):
-                abs(horizontalOffset)
+            case .tiltLeft:
+                -SplitHeadCharacterRig.speakingCadenceHorizontalOffset
+            case .tiltRight:
+                SplitHeadCharacterRig.speakingCadenceHorizontalOffset
             }
         }
 
@@ -43,51 +42,40 @@ final class CharacterAnimator {
             }
         }
 
-        func offset(for speakingOffset: CGFloat, listeningOffset: CGFloat) -> CGFloat {
+        var offset: CGFloat {
             switch self {
             case .center:
-                return speakingOffset
+                SplitHeadCharacterRig.speakingCadenceCenterOffset
             case .tiltLeft, .tiltRight:
-                let extraOpen = max(0, speakingOffset - listeningOffset)
-                return listeningOffset + (extraOpen * Self.sideOpenLiftScale)
-            }
-        }
-
-        static func random() -> Self {
-            switch Int.random(in: 0..<5) {
-            case 0:
-                .center
-            case 1, 2:
-                .tiltLeft(
-                    tiltDegrees: CGFloat.random(in: 10...15),
-                    horizontalOffset: CGFloat.random(in: 0.1...0.7)
-                )
-            default:
-                .tiltRight(
-                    tiltDegrees: CGFloat.random(in: 10...15),
-                    horizontalOffset: CGFloat.random(in: 0.1...0.7)
-                )
+                SplitHeadCharacterRig.speakingCadenceSideOffset
             }
         }
     }
 
-    private static let speechPulseOpenThreshold: CGFloat = 0.16
-    private static let speechPulseCloseThreshold: CGFloat = 0.07
-    private static let speechPoseRefreshRiseThreshold: CGFloat = 0.11
-    private static let speechPoseRefreshMinimumLevel: CGFloat = 0.21
+    private static let speechCadenceOpenThreshold: CGFloat = 0.16
+    private static let speechCadenceCloseThreshold: CGFloat = 0.07
+    private static let speechBeatSequence: [SpeechPose] = [.center, .tiltLeft, .center, .tiltRight]
+    private static let idleBlinkIntervalRange: ClosedRange<TimeInterval> = 4.8...8.4
+    private static let listeningBlinkIntervalRange: ClosedRange<TimeInterval> = 5.4...9.2
 
     private let rig: SplitHeadCharacterRig
-    private let speechPoseSampler: () -> SpeechPose
+    private let automaticallyAdvanceSpeechCadence: Bool
     private var currentState: CharacterState = .idle
     private var currentSpeechLevel: CGFloat = 0
-    private var isSpeechPulseOpen = false
-    private var currentSpeechPose: SpeechPose?
-    private var lowestSpeechLevelSincePoseSelection: CGFloat = 1
+    private var isSpeechCadenceActive = false
+    private var currentSpeechBeatIndex = 0
+    private var speechCadenceTimer: Timer?
+    private var blinkTimer: Timer?
 
-    init(rig: SplitHeadCharacterRig, speechPoseSampler: @escaping () -> SpeechPose = SpeechPose.random) {
+    init(rig: SplitHeadCharacterRig, automaticallyAdvanceSpeechCadence: Bool = true) {
         self.rig = rig
-        self.speechPoseSampler = speechPoseSampler
+        self.automaticallyAdvanceSpeechCadence = automaticallyAdvanceSpeechCadence
         apply(state: .idle)
+    }
+
+    deinit {
+        speechCadenceTimer?.invalidate()
+        blinkTimer?.invalidate()
     }
 
     func apply(state: CharacterState) {
@@ -104,18 +92,28 @@ final class CharacterAnimator {
 
         switch currentState {
         case .speaking:
-            applySpeechLevel(currentSpeechLevel, animated: true)
+            updateSpeechCadence(animated: true, refreshCurrentPose: false)
         case .idle, .listening, .disabled, .error:
             return
         }
     }
 
+    func advanceSpeechBeat() {
+        guard currentState == .speaking, isSpeechCadenceActive else {
+            return
+        }
+
+        currentSpeechBeatIndex = (currentSpeechBeatIndex + 1) % Self.speechBeatSequence.count
+        applyCurrentSpeechBeat(animated: true)
+    }
+
     private func renderCurrentState(animated: Bool) {
         clearAnimations()
         rig.applyBaseAppearance(for: currentState)
+        updateBlinkScheduling()
 
         if currentState != .speaking {
-            resetSpeechPulse()
+            stopSpeechCadence(resetBeatIndex: true)
         }
 
         switch currentState {
@@ -127,7 +125,7 @@ final class CharacterAnimator {
             rig.setUpperHeadListening(true, animated: animated)
         case .speaking:
             rig.setGlow(active: true, animated: animated)
-            applySpeechLevel(currentSpeechLevel, animated: animated)
+            updateSpeechCadence(animated: animated, refreshCurrentPose: true)
         case .disabled:
             rig.setGlow(active: false, animated: false)
             rig.setUpperHeadOpen(false, animated: false)
@@ -141,57 +139,120 @@ final class CharacterAnimator {
         rig.upperHeadLayer.removeAllAnimations()
     }
 
-    private func resetSpeechPulse() {
-        isSpeechPulseOpen = false
-        currentSpeechPose = nil
-        lowestSpeechLevelSincePoseSelection = 1
+    private func startSpeechCadence(animated: Bool) {
+        isSpeechCadenceActive = true
+        currentSpeechBeatIndex = 0
+        applyCurrentSpeechBeat(animated: animated)
+        scheduleSpeechCadenceTimerIfNeeded()
     }
 
-    private func updateSpeechPose(for normalizedLevel: CGFloat) {
-        if isSpeechPulseOpen {
-            guard normalizedLevel > Self.speechPulseCloseThreshold else {
-                resetSpeechPulse()
+    private func stopSpeechCadence(resetBeatIndex: Bool) {
+        speechCadenceTimer?.invalidate()
+        speechCadenceTimer = nil
+        isSpeechCadenceActive = false
+        if resetBeatIndex {
+            currentSpeechBeatIndex = 0
+        }
+    }
+
+    private func updateSpeechCadence(animated: Bool, refreshCurrentPose: Bool) {
+        if isSpeechCadenceActive {
+            guard currentSpeechLevel > Self.speechCadenceCloseThreshold else {
+                stopSpeechCadence(resetBeatIndex: true)
+                rig.setUpperHeadListening(true, animated: animated)
                 return
             }
 
-            lowestSpeechLevelSincePoseSelection = min(lowestSpeechLevelSincePoseSelection, normalizedLevel)
-
-            guard normalizedLevel >= Self.speechPoseRefreshMinimumLevel else {
-                return
+            if refreshCurrentPose {
+                applyCurrentSpeechBeat(animated: animated)
             }
 
-            guard normalizedLevel - lowestSpeechLevelSincePoseSelection >= Self.speechPoseRefreshRiseThreshold else {
-                return
-            }
-
-            currentSpeechPose = speechPoseSampler()
-            lowestSpeechLevelSincePoseSelection = normalizedLevel
+            scheduleSpeechCadenceTimerIfNeeded()
             return
         }
 
-        guard normalizedLevel >= Self.speechPulseOpenThreshold else {
+        guard currentSpeechLevel >= Self.speechCadenceOpenThreshold else {
+            rig.setUpperHeadListening(true, animated: animated)
             return
         }
 
-        isSpeechPulseOpen = true
-        currentSpeechPose = speechPoseSampler()
-        lowestSpeechLevelSincePoseSelection = normalizedLevel
+        startSpeechCadence(animated: animated)
     }
 
-    private func applySpeechLevel(_ normalizedLevel: CGFloat, animated: Bool) {
-        updateSpeechPose(for: normalizedLevel)
-        let speakingOffset = rig.speakingOffset(for: normalizedLevel)
-        let speechPose = currentSpeechPose
+    private func applyCurrentSpeechBeat(animated: Bool) {
+        let speechPose = Self.speechBeatSequence[currentSpeechBeatIndex]
         rig.setUpperHeadPose(
-            offset: speechPose?.offset(
-                for: speakingOffset,
-                listeningOffset: SplitHeadCharacterRig.upperHeadListeningOffset
-            ) ?? speakingOffset,
-            tiltDegrees: speechPose?.tiltDegrees ?? 0,
-            horizontalOffset: speechPose?.horizontalOffset ?? 0,
-            hingeAlignment: speechPose?.hingeAlignment ?? .centered,
+            offset: speechPose.offset,
+            tiltDegrees: speechPose.tiltDegrees,
+            horizontalOffset: speechPose.horizontalOffset,
+            hingeAlignment: speechPose.hingeAlignment,
             animated: animated,
             duration: SplitHeadCharacterRig.speechAnimationDuration
         )
+    }
+
+    private func scheduleSpeechCadenceTimerIfNeeded() {
+        guard automaticallyAdvanceSpeechCadence, speechCadenceTimer == nil else {
+            return
+        }
+
+        let timer = Timer(
+            timeInterval: SplitHeadCharacterRig.speakingCadenceBeatDuration,
+            repeats: true
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else {
+                    return
+                }
+
+                self.advanceSpeechBeat()
+            }
+        }
+        speechCadenceTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func updateBlinkScheduling() {
+        guard let intervalRange = blinkIntervalRange(for: currentState) else {
+            blinkTimer?.invalidate()
+            blinkTimer = nil
+            return
+        }
+
+        guard blinkTimer == nil else {
+            return
+        }
+
+        let timer = Timer(
+            timeInterval: TimeInterval.random(in: intervalRange),
+            repeats: false
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else {
+                    return
+                }
+
+                self.blinkTimer = nil
+                guard self.blinkIntervalRange(for: self.currentState) != nil else {
+                    return
+                }
+
+                self.rig.blink()
+                self.updateBlinkScheduling()
+            }
+        }
+        blinkTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func blinkIntervalRange(for state: CharacterState) -> ClosedRange<TimeInterval>? {
+        switch state {
+        case .idle:
+            Self.idleBlinkIntervalRange
+        case .listening:
+            Self.listeningBlinkIntervalRange
+        case .speaking, .disabled, .error:
+            nil
+        }
     }
 }

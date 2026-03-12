@@ -27,14 +27,23 @@ final class SplitHeadCharacterRig {
     nonisolated static let upperHeadLeftHingeAnchorPoint = CGPoint(x: 0.23, y: 0.623)
     nonisolated static let upperHeadRightHingeAnchorPoint = CGPoint(x: 0.753, y: 0.623)
     nonisolated static let activeCoverScale: CGFloat = 2.0
-    nonisolated static let activeCoverCanvasSize = CGSize(
-        width: canvasSize.width * activeCoverScale,
-        height: canvasSize.height * activeCoverScale
-    )
     nonisolated static let upperHeadListeningOffset: CGFloat = 5
     nonisolated static let upperHeadOpenOffset: CGFloat = 28
     nonisolated static let stateAnimationDuration: CFTimeInterval = 0.10
-    nonisolated static let speechAnimationDuration: CFTimeInterval = 0.045
+    nonisolated static let speechAnimationDuration: CFTimeInterval = 0.09
+    nonisolated static let speakingCadenceBeatDuration: CFTimeInterval = 0.14
+    nonisolated static let speakingCadenceCenterOffset: CGFloat = 18
+    nonisolated static let speakingCadenceSideOffset: CGFloat = 11
+    nonisolated static let speakingCadenceTiltDegrees: CGFloat = 8
+    nonisolated static let speakingCadenceHorizontalOffset: CGFloat = 2
+    nonisolated static let activeCoverTopPadding: CGFloat = speakingCadenceCenterOffset + 4
+    nonisolated static let blinkDuration: CFTimeInterval = 0.16
+    nonisolated static var activeCoverCanvasSize: CGSize {
+        CGSize(
+            width: canvasSize.width * activeCoverScale,
+            height: (canvasSize.height + activeCoverTopPadding) * activeCoverScale
+        )
+    }
     nonisolated static let expandScaleAnimationDuration: CFTimeInterval = 0.085
     nonisolated static let collapseScaleAnimationDuration: CFTimeInterval = 0.12
 
@@ -42,9 +51,14 @@ final class SplitHeadCharacterRig {
     let characterLayer = CALayer()
     let fixedBaseLayer = CALayer()
     let upperHeadLayer = CALayer()
+    let leftEyeBlinkCoverLayer = CALayer()
+    let rightEyeBlinkCoverLayer = CALayer()
+    let leftEyeClosedLineLayer = CALayer()
+    let rightEyeClosedLineLayer = CALayer()
 
     private let accentGlowColor = NSColor(calibratedRed: 0.34, green: 0.74, blue: 0.95, alpha: 1)
     private let errorGlowColor = NSColor.systemRed
+    private let upperHeadColor = NSColor(calibratedRed: 0.94, green: 0.84, blue: 0.72, alpha: 1)
     private var upperHeadClosedPosition = CGPoint.zero
     private(set) var displayScale: CGFloat = 1
     private(set) var upperHeadTiltDegrees: CGFloat = 0
@@ -72,6 +86,7 @@ final class SplitHeadCharacterRig {
         upperHeadLayer.bounds = localBounds
         upperHeadClosedPosition = Self.closedUpperHeadPosition(in: localBounds, hingeAlignment: upperHeadHingeAlignment)
         upperHeadLayer.position = upperHeadClosedPosition
+        layoutEyeLayers(in: localBounds)
 
         let glowInsetX = localBounds.width * 0.16
         let glowInsetY = localBounds.height * 0.18
@@ -211,6 +226,11 @@ final class SplitHeadCharacterRig {
         CATransaction.commit()
     }
 
+    func blink() {
+        animateBlink(coverLayer: leftEyeBlinkCoverLayer, closedLineLayer: leftEyeClosedLineLayer)
+        animateBlink(coverLayer: rightEyeBlinkCoverLayer, closedLineLayer: rightEyeClosedLineLayer)
+    }
+
     private func configureRootLayer() {
         rootLayer.backgroundColor = NSColor.clear.cgColor
         rootLayer.masksToBounds = false
@@ -236,12 +256,20 @@ final class SplitHeadCharacterRig {
         configureImageLayer(
             upperHeadLayer,
             named: "YappyUpperHead",
-            fallbackColor: NSColor(calibratedRed: 0.94, green: 0.84, blue: 0.72, alpha: 1)
+            fallbackColor: upperHeadColor
         )
         upperHeadLayer.anchorPoint = Self.upperHeadCenterAnchorPoint
+        configureEyeBlinkLayer(leftEyeBlinkCoverLayer)
+        configureEyeBlinkLayer(rightEyeBlinkCoverLayer)
+        configureClosedEyeLineLayer(leftEyeClosedLineLayer)
+        configureClosedEyeLineLayer(rightEyeClosedLineLayer)
 
         characterLayer.addSublayer(fixedBaseLayer)
         characterLayer.addSublayer(upperHeadLayer)
+        upperHeadLayer.addSublayer(leftEyeBlinkCoverLayer)
+        upperHeadLayer.addSublayer(rightEyeBlinkCoverLayer)
+        upperHeadLayer.addSublayer(leftEyeClosedLineLayer)
+        upperHeadLayer.addSublayer(rightEyeClosedLineLayer)
     }
 
     private static func closedUpperHeadPosition(
@@ -269,4 +297,121 @@ final class SplitHeadCharacterRig {
             layer.backgroundColor = NSColor.clear.cgColor
         }
     }
+
+    private func configureEyeBlinkLayer(_ layer: CALayer) {
+        layer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+        layer.backgroundColor = upperHeadColor.cgColor
+        layer.opacity = 0
+        layer.transform = CATransform3DMakeScale(1, Self.eyeOpenScaleY, 1)
+        layer.zPosition = 2
+        layer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
+    }
+
+    private func configureClosedEyeLineLayer(_ layer: CALayer) {
+        layer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+        layer.backgroundColor = NSColor.black.cgColor
+        layer.opacity = 0
+        layer.zPosition = 3
+        layer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
+    }
+
+    private func layoutEyeLayers(in bounds: CGRect) {
+        layoutEye(
+            coverLayer: leftEyeBlinkCoverLayer,
+            closedLineLayer: leftEyeClosedLineLayer,
+            center: Self.leftEyeCenter,
+            in: bounds
+        )
+        layoutEye(
+            coverLayer: rightEyeBlinkCoverLayer,
+            closedLineLayer: rightEyeClosedLineLayer,
+            center: Self.rightEyeCenter,
+            in: bounds
+        )
+    }
+
+    private func layoutEye(
+        coverLayer: CALayer,
+        closedLineLayer: CALayer,
+        center: CGPoint,
+        in bounds: CGRect
+    ) {
+        let eyeCenter = CGPoint(
+            x: bounds.minX + (bounds.width * center.x),
+            y: bounds.minY + (bounds.height * center.y)
+        )
+        let coverSize = CGSize(
+            width: bounds.width * Self.eyeCoverWidthScale,
+            height: bounds.height * Self.eyeCoverHeightScale
+        )
+        let closedLineSize = CGSize(
+            width: bounds.width * Self.eyeClosedLineWidthScale,
+            height: max(1, bounds.height * Self.eyeClosedLineHeightScale)
+        )
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        coverLayer.bounds = CGRect(origin: .zero, size: coverSize)
+        coverLayer.position = eyeCenter
+        coverLayer.cornerRadius = coverSize.height / 2
+        coverLayer.opacity = 0
+        coverLayer.transform = CATransform3DMakeScale(1, Self.eyeOpenScaleY, 1)
+
+        closedLineLayer.bounds = CGRect(origin: .zero, size: closedLineSize)
+        closedLineLayer.position = eyeCenter
+        closedLineLayer.cornerRadius = closedLineSize.height / 2
+        closedLineLayer.opacity = 0
+        CATransaction.commit()
+    }
+
+    private func animateBlink(coverLayer: CALayer, closedLineLayer: CALayer) {
+        coverLayer.removeAnimation(forKey: Self.blinkAnimationKey)
+        coverLayer.removeAnimation(forKey: Self.blinkOpacityAnimationKey)
+        closedLineLayer.removeAnimation(forKey: Self.closedEyeLineAnimationKey)
+
+        let coverAnimation = CAKeyframeAnimation(keyPath: "transform.scale.y")
+        coverAnimation.values = [Self.eyeOpenScaleY, 1, 1, Self.eyeOpenScaleY]
+        coverAnimation.keyTimes = [0, 0.45, 0.65, 1]
+        coverAnimation.duration = Self.blinkDuration
+        coverAnimation.timingFunctions = [
+            CAMediaTimingFunction(name: .easeInEaseOut),
+            CAMediaTimingFunction(name: .easeInEaseOut),
+            CAMediaTimingFunction(name: .easeInEaseOut)
+        ]
+        coverLayer.add(coverAnimation, forKey: Self.blinkAnimationKey)
+
+        let coverOpacityAnimation = CAKeyframeAnimation(keyPath: "opacity")
+        coverOpacityAnimation.values = [0, 1, 1, 0]
+        coverOpacityAnimation.keyTimes = [0, 0.2, 0.8, 1]
+        coverOpacityAnimation.duration = Self.blinkDuration
+        coverOpacityAnimation.timingFunctions = [
+            CAMediaTimingFunction(name: .easeInEaseOut),
+            CAMediaTimingFunction(name: .easeInEaseOut),
+            CAMediaTimingFunction(name: .easeInEaseOut)
+        ]
+        coverLayer.add(coverOpacityAnimation, forKey: Self.blinkOpacityAnimationKey)
+
+        let closedLineAnimation = CAKeyframeAnimation(keyPath: "opacity")
+        closedLineAnimation.values = [0, 0, 1, 1, 0]
+        closedLineAnimation.keyTimes = [0, 0.3, 0.45, 0.65, 1]
+        closedLineAnimation.duration = Self.blinkDuration
+        closedLineAnimation.timingFunctions = [
+            CAMediaTimingFunction(name: .easeInEaseOut),
+            CAMediaTimingFunction(name: .easeInEaseOut),
+            CAMediaTimingFunction(name: .easeInEaseOut),
+            CAMediaTimingFunction(name: .easeInEaseOut)
+        ]
+        closedLineLayer.add(closedLineAnimation, forKey: Self.closedEyeLineAnimationKey)
+    }
+
+    private static let eyeOpenScaleY: CGFloat = 0
+    private static let eyeCoverWidthScale: CGFloat = 0.108
+    private static let eyeCoverHeightScale: CGFloat = 0.14
+    private static let eyeClosedLineWidthScale: CGFloat = 0.086
+    private static let eyeClosedLineHeightScale: CGFloat = 0.018
+    private static let leftEyeCenter = CGPoint(x: 0.419, y: 0.525)
+    private static let rightEyeCenter = CGPoint(x: 0.568, y: 0.518)
+    private static let blinkAnimationKey = "blink.scale"
+    private static let blinkOpacityAnimationKey = "blink.opacity"
+    private static let closedEyeLineAnimationKey = "blink.lineOpacity"
 }
